@@ -435,4 +435,68 @@ describe('transform', () => {
       .join('\n');
     expect(allText).toContain('<system-reminder>');
   });
+
+  it('compresses large tool_result text content across user messages', async () => {
+    const bigResult = 'output line. '.repeat(500);
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_x',
+                content: bigResult,
+              },
+            ],
+          },
+        ],
+        system: 'claude.md\n'.repeat(500),
+      }),
+    );
+    const { body: outBytes, info } = await transformRequest(body);
+    expect(info.toolResultImgs).toBeGreaterThanOrEqual(1);
+
+    const out = JSON.parse(new TextDecoder().decode(outBytes));
+    // Find the tool_result block and confirm its content is now image blocks.
+    const tr = (out.messages[0].content as any[]).find((b: any) => b.type === 'tool_result');
+    expect(tr).toBeDefined();
+    expect(Array.isArray(tr.content)).toBe(true);
+    const imgInner = (tr.content as any[]).filter((b: any) => b.type === 'image');
+    expect(imgInner.length).toBeGreaterThanOrEqual(1);
+    // No cache_control on tool_result images.
+    for (const b of imgInner) expect(b.cache_control).toBeUndefined();
+  });
+
+  it('leaves is_error tool_results untouched (Anthropic forbids images there)', async () => {
+    const bigResult = 'error trace. '.repeat(500);
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_x',
+                content: bigResult,
+                is_error: true,
+              },
+            ],
+          },
+        ],
+        system: 'claude.md\n'.repeat(500),
+      }),
+    );
+    const { body: outBytes, info } = await transformRequest(body);
+    expect(info.toolResultImgs ?? 0).toBe(0);
+    const out = JSON.parse(new TextDecoder().decode(outBytes));
+    const tr = (out.messages[0].content as any[]).find((b: any) => b.type === 'tool_result');
+    expect(tr).toBeDefined();
+    expect(tr.is_error).toBe(true);
+    expect(typeof tr.content).toBe('string');
+  });
 });

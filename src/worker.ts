@@ -23,8 +23,10 @@ export interface Env {
   COMPRESS_TOOLS?: string;
   COMPRESS_SCHEMAS?: string;
   COMPRESS_REMINDERS?: string;
+  COMPRESS_TOOL_RESULTS?: string;
   MIN_COMPRESS_CHARS?: string;
   MIN_REMINDER_CHARS?: string;
+  MIN_TOOL_RESULT_CHARS?: string;
   PLACEMENT?: string;
   COLS?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
@@ -43,8 +45,10 @@ export default {
       compressTools: truthy(env.COMPRESS_TOOLS, true),
       compressSchemas: truthy(env.COMPRESS_SCHEMAS, true),
       compressReminders: truthy(env.COMPRESS_REMINDERS, true),
+      compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
       minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 1000,
+      minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 2000,
       placement: (env.PLACEMENT as 'system' | 'user') ?? 'user',
       cols: env.COLS ? Number(env.COLS) : 100,
     };

@@ -16,6 +16,7 @@ import type {
   SystemField,
   TextBlock,
   ToolDef,
+  ToolResultBlock,
 } from './types.js';
 import { renderTextToPngs } from './render.js';
 import { bytesToBase64 } from './png.js';
@@ -33,10 +34,16 @@ export interface TransformOptions {
    *  Claude Code re-injects these every turn; rendering them to images shares
    *  the cache anchor with the system+tools render. */
   compressReminders?: boolean;
+  /** Compress large tool_result text content across all user messages. Tool
+   *  output is static once produced and accumulates across the conversation,
+   *  so image-rendering it compounds savings as the session grows. */
+  compressToolResults?: boolean;
   /** Don't compress if total compressible chars below this. */
   minCompressChars?: number;
   /** Per-block threshold for compressReminders (chars). */
   minReminderChars?: number;
+  /** Per-block threshold for compressToolResults (chars). */
+  minToolResultChars?: number;
   /** Where to attach the image block — system field, or first user message. */
   placement?: 'system' | 'user';
   /** Soft-wrap column count. */
@@ -49,9 +56,11 @@ const DEFAULTS: Required<TransformOptions> = {
   compressTools: true,
   compressSchemas: true,
   compressReminders: true,
+  compressToolResults: true,
   minCompressChars: 2000,
-  // Matches Python defaults: 1000 chars for <system-reminder>.
+  // Matches Python defaults: 1000 chars for <system-reminder>, 2000 for tool_result.
   minReminderChars: 1000,
+  minToolResultChars: 2000,
   // Anthropic's `system` field accepts text blocks only — image blocks there
   // come back as `400 system.N.type: Input should be 'text'`. Images must go
   // into a user message instead.
@@ -110,6 +119,9 @@ export interface TransformInfo {
   /** Number of images we added by compressing `<system-reminder>` blocks in
    *  the first user message. */
   reminderImgs?: number;
+  /** Number of images we added by compressing tool_result content across
+   *  user messages. */
+  toolResultImgs?: number;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -553,6 +565,69 @@ export async function transformRequest(
         { type: 'text' as const, text: '[End of rendered context.]' },
         ...processedExisting,
       ];
+    }
+
+    // 5b. tool_result compression — walks ALL user messages (not just the
+    // first). Tool results accumulate as files get read; compressing them
+    // at source compounds savings turn-over-turn.
+    if (o.compressToolResults) {
+      for (const msg of req.messages ?? []) {
+        if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+        const rewritten: ContentBlock[] = [];
+        let changed = false;
+        for (const blk of msg.content) {
+          if (blk && (blk as ToolResultBlock).type === 'tool_result') {
+            const tr = blk as ToolResultBlock;
+            // Anthropic rejects images inside is_error tool_results — leave alone.
+            if (tr.is_error === true) {
+              rewritten.push(blk);
+              continue;
+            }
+            const inner = tr.content;
+            if (typeof inner === 'string' && inner.length >= o.minToolResultChars) {
+              const imgs = await textToImageBlocks(inner, o.cols);
+              for (const img of imgs) info.imageBytes += approxBlockBytes(img);
+              info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
+              info.imageCount += imgs.length;
+              rewritten.push({ ...tr, content: imgs });
+              changed = true;
+            } else if (Array.isArray(inner)) {
+              const newInner: Array<TextBlock | ImageBlock> = [];
+              let innerChanged = false;
+              for (const ib of inner) {
+                if (
+                  ib &&
+                  (ib as TextBlock).type === 'text' &&
+                  typeof (ib as TextBlock).text === 'string' &&
+                  (ib as TextBlock).text.length >= o.minToolResultChars
+                ) {
+                  const imgs = await textToImageBlocks((ib as TextBlock).text, o.cols);
+                  for (const img of imgs) {
+                    newInner.push(img);
+                    info.imageBytes += approxBlockBytes(img);
+                  }
+                  info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
+                  info.imageCount += imgs.length;
+                  innerChanged = true;
+                } else {
+                  newInner.push(ib as TextBlock | ImageBlock);
+                }
+              }
+              if (innerChanged) {
+                rewritten.push({ ...tr, content: newInner });
+                changed = true;
+              } else {
+                rewritten.push(blk);
+              }
+            } else {
+              rewritten.push(blk);
+            }
+          } else {
+            rewritten.push(blk);
+          }
+        }
+        if (changed) msg.content = rewritten;
+      }
     }
   }
 

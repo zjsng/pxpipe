@@ -22,8 +22,10 @@ interface CliOpts {
   compressTools: boolean;
   compressSchemas: boolean;
   compressReminders: boolean;
+  compressToolResults: boolean;
   minCompressChars: number;
   minReminderChars: number;
+  minToolResultChars: number;
   placement: 'system' | 'user';
   cols: number;
   /** When true, append per-request events to eventsFile. Default-on. */
@@ -46,8 +48,10 @@ function parseCli(argv: string[]): CliOpts {
     compressTools: envFlag('COMPRESS_TOOLS', true),
     compressSchemas: envFlag('COMPRESS_SCHEMAS', true),
     compressReminders: envFlag('COMPRESS_REMINDERS', true),
+    compressToolResults: envFlag('COMPRESS_TOOL_RESULTS', true),
     minCompressChars: Number(process.env.MIN_COMPRESS_CHARS ?? 2000),
     minReminderChars: Number(process.env.MIN_REMINDER_CHARS ?? 1000),
+    minToolResultChars: Number(process.env.MIN_TOOL_RESULT_CHARS ?? 2000),
     placement: (process.env.PLACEMENT as 'system' | 'user') ?? 'user',
     cols: Number(process.env.COLS ?? 100),
     track: envFlag('PIXELPIPE_TRACK', true),
@@ -66,8 +70,10 @@ function parseCli(argv: string[]): CliOpts {
       case '--no-tools':       o.compressTools = false; break;
       case '--no-schemas':     o.compressSchemas = false; break;
       case '--no-reminders':   o.compressReminders = false; break;
+      case '--no-tool-results':o.compressToolResults = false; break;
       case '--min-chars':      o.minCompressChars = Number(eat()); break;
       case '--min-reminder-chars': o.minReminderChars = Number(eat()); break;
+      case '--min-tool-result-chars': o.minToolResultChars = Number(eat()); break;
       case '--placement':      o.placement = eat() as 'system' | 'user'; break;
       case '--cols':           o.cols = Number(eat()); break;
       case '--no-track':       o.track = false; break;
@@ -99,8 +105,10 @@ Options:
       --no-tools          don't fold tool docs into the image
       --no-schemas        don't include input_schema JSON in the image
       --no-reminders      don't image-compress <system-reminder> blocks
+      --no-tool-results   don't image-compress large tool_result content
       --min-chars <N>     skip system compression below this many chars (default 2000)
       --min-reminder-chars <N>  per-block threshold for --no-reminders (default 1000)
+      --min-tool-result-chars <N>  per-block threshold for --no-tool-results (default 2000)
       --placement <where> 'system' or 'user' (default user; 'system' is
                           rejected by the API for image blocks)
       --cols <N>          soft-wrap column count (default 100)
@@ -111,8 +119,9 @@ Options:
 
 Environment:
   Same as flags via PORT, ANTHROPIC_UPSTREAM, COMPRESS, COMPRESS_TOOLS,
-  COMPRESS_SCHEMAS, COMPRESS_REMINDERS, MIN_COMPRESS_CHARS,
-  MIN_REMINDER_CHARS, PLACEMENT, COLS, PIXELPIPE_TRACK, PIXELPIPE_LOG.
+  COMPRESS_SCHEMAS, COMPRESS_REMINDERS, COMPRESS_TOOL_RESULTS,
+  MIN_COMPRESS_CHARS, MIN_REMINDER_CHARS, MIN_TOOL_RESULT_CHARS, PLACEMENT,
+  COLS, PIXELPIPE_TRACK, PIXELPIPE_LOG.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -314,8 +323,10 @@ async function main(): Promise<void> {
     compressTools: opts.compressTools,
     compressSchemas: opts.compressSchemas,
     compressReminders: opts.compressReminders,
+    compressToolResults: opts.compressToolResults,
     minCompressChars: opts.minCompressChars,
     minReminderChars: opts.minReminderChars,
+    minToolResultChars: opts.minToolResultChars,
     placement: opts.placement,
     cols: opts.cols,
   };
@@ -338,6 +349,7 @@ async function main(): Promise<void> {
       // Terse human-readable console line.
       const extra: string[] = [];
       if (e.info?.reminderImgs) extra.push(`rem+${e.info.reminderImgs}`);
+      if (e.info?.toolResultImgs) extra.push(`tr+${e.info.toolResultImgs}`);
       const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
@@ -402,7 +414,7 @@ async function main(): Promise<void> {
   server.listen(opts.port, () => {
     console.log(`[pixelpipe] listening on http://127.0.0.1:${opts.port} → ${opts.upstream}`);
     console.log(
-      `[pixelpipe] config: compress=${opts.compress} tools=${opts.compressTools} schemas=${opts.compressSchemas} reminders=${opts.compressReminders} min=${opts.minCompressChars} placement=${opts.placement} cols=${opts.cols}`,
+      `[pixelpipe] config: compress=${opts.compress} tools=${opts.compressTools} schemas=${opts.compressSchemas} reminders=${opts.compressReminders} tool_results=${opts.compressToolResults} min=${opts.minCompressChars} placement=${opts.placement} cols=${opts.cols}`,
     );
     if (opts.track) console.log(`[pixelpipe] tracking events → ${opts.eventsFile}`);
     else console.log('[pixelpipe] tracking disabled (--no-track or PIXELPIPE_TRACK=0)');
