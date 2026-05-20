@@ -138,36 +138,67 @@ const DEFAULTS: Required<TransformOptions> = {
 
 // --- per-block break-even check ---
 //
-// Anthropic's real per-image cost is ~2,500 tokens (history-researcher's
-// round-3 N=33 measurement on cold-miss events 2026-05-18, single-col
-// 508×1559 PNGs). Compressing a text block to an image is only profitable
-// when the text would have cost MORE than `ceil(textLen / chars-per-image)
-// × tokens-per-image` tokens. For small blocks, image cost dominates and
-// we should leave them as text.
+// Anthropic's real per-image cost is ~2,500 tokens at SINGLE-COL
+// (history-researcher's round-3 N=33 measurement on cold-miss events
+// 2026-05-18, single-col 508×1559 PNGs). The published theoretical
+// formula `(w × h) / 750` gives ~1,056 tokens for that geometry and
+// underpredicts actual Anthropic billing by ~2.4×. We use the empirical
+// 2,500 at numCols=1 and SCALE LINEARLY by numCols for wider canvases
+// (multi-col packs N text columns side-by-side, multiplying pixel area
+// and — per Anthropic's area-proportional billing model — token cost).
 //
-// The published theoretical formula `(w × h) / 750` gives ~1,056 tokens
-// for single-col 508×1559 and underpredicts actual Anthropic billing by
-// ~2.4×. We use the empirical 2,500 constant until a fresh measurement
-// re-grounds it at the current renderer config (multi-col 2 cost is
-// not yet measured — if it scales with pixel area at the same 2.4×
-// empirical multiplier, multi-col 2 would land near ~5,100 tokens/image
-// and the 2,500 gate UNDER-estimates per-image cost at numCols≥2. TODO:
-// instrument cold-miss billing across {1,2,3} cols and re-grade.
+// Safety: the gate's job is to compress a block only when doing so saves
+// tokens. The constants below bias CONSERVATIVE — every uncertainty
+// resolves in favor of pass-through, so a misprediction at worst leaves
+// money on the table; it never burns money on a net-loss image:
+//   • CHARS_PER_TOKEN = 4 over-estimates tokens-per-char for typical
+//     tool_result code/JSON (real cpt ≈ 3-3.5), which UNDER-estimates
+//     text savings → bias toward pass-through.
+//   • numCols=1 cost is empirical (2500). numCols≥2 cost is linearly
+//     extrapolated + 10% margin since we don't yet have empirical
+//     measurements at wider canvases. Over-stating image cost ALSO
+//     biases toward pass-through.
 //
 // Production bug context (2026-05-19): a request with orig_chars=169k spread
 // across 88 small blocks each cost ~2,500 tokens as images = 220k tokens
 // when the text would have been only 42k tokens. The flat per-block-min
 // threshold (5k) was wide of the break-even point (10k) and let net-loss
-// compressions through. The check below is the real gate.
+// compressions through.
+//
+// Multi-col safety hole (closed 2026-05-19): production runs multiCol=2
+// by default. The OLD flat `TOKENS_PER_IMAGE = 2500` applied at all
+// numCols, so the gate believed multi-col images were ~2× cheaper than
+// they actually are and would compress slabs that net-lost in reality.
+// The scaled cost below fixes that — at multiCol≥2, image cost reflects
+// the wider canvas.
 
 /** English ~4 chars per token average. Holds well enough for code + prose
  *  mix; tool_result content is typically code-shaped. */
 const CHARS_PER_TOKEN = 4;
 
-/** Empirical per-image cost (see dashboard.ts comment for the measurement
- *  trace). Kept here as a constant rather than imported from dashboard.ts
+/** Empirical per-image cost at numCols=1. Source: dashboard.ts measurement
+ *  trace. Kept here as a constant rather than imported from dashboard.ts
  *  to keep `src/core/` free of dashboard imports — that's a one-way edge. */
-const TOKENS_PER_IMAGE = 2500;
+const TOKENS_PER_IMAGE_SINGLE_COL = 2500;
+
+/** Effective per-image token cost at the given `numCols`. Single-col is
+ *  the calibrated measurement; multi-col scales linearly with the number
+ *  of text columns packed per image (Anthropic bills proportional to
+ *  pixel area, which doubles/triples with numCols). The 10% multi-col
+ *  margin absorbs extrapolation noise since we don't yet have empirical
+ *  cost measurements at numCols≥2 — biases toward pass-through, never
+ *  toward letting a net-loss through.
+ *
+ *  Why bias conservative: the gate's only job is "compress if and only if
+ *  doing so saves tokens." If the constant is too low, we compress
+ *  net-losers and overpay. If it's too high, we miss profitable
+ *  compressions but never overpay. The user's constraint is "don't lose
+ *  money" — accept missed opportunities, reject misses-that-overpay. */
+function effectiveTokensPerImage(numCols: number): number {
+  const n = Math.max(1, numCols | 0);
+  if (n === 1) return TOKENS_PER_IMAGE_SINGLE_COL;
+  return Math.ceil(TOKENS_PER_IMAGE_SINGLE_COL * n * 1.10);
+}
 
 /** Characters per rendered image at the current renderer config. Derived
  *  at runtime from `ATLAS_CELL_H` (cell height) and the render canvas
@@ -245,7 +276,7 @@ export function isCompressionProfitable(
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokensCost = estImages * TOKENS_PER_IMAGE;
+  const imageTokensCost = estImages * effectiveTokensPerImage(n);
   const textTokensEquivalent = textLen / cpt;
   return imageTokensCost < textTokensEquivalent;
 }

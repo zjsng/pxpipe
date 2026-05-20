@@ -276,7 +276,7 @@ function makeReq(toolResultText: string) {
       // break-even (≥10k chars) so the main static-slab compression runs
       // and `info.compressed` flips to true. Smaller slabs no-op out via
       // isCompressionProfitable and the test wouldn't see compressed=true.
-      system: 'x'.repeat(60_000),
+      system: 'x'.repeat(80_000),
       messages: [
         {
           role: 'user',
@@ -291,8 +291,9 @@ function makeReq(toolResultText: string) {
 
 describe('paging end-to-end (transformRequest)', () => {
   it('tool_result under cap renders normally (no truncation counters)', async () => {
-    // Above 10k break-even, well under the 10-image budget (~140k chars).
-    const text = 'x'.repeat(40_000);
+    // Above the multi-col break-even (~22k chars), well under the 10-image
+    // budget (~140k chars).
+    const text = 'x'.repeat(50_000);
     const { info } = await transformRequest(makeReq(text));
     expect(info.compressed).toBe(true);
     expect((info.toolResultImgs ?? 0)).toBeGreaterThan(0);
@@ -344,7 +345,7 @@ describe('paging end-to-end (transformRequest)', () => {
     const req = new TextEncoder().encode(
       JSON.stringify({
         model: 'claude-3-5-sonnet',
-        system: 'x'.repeat(60_000),
+        system: 'x'.repeat(80_000),
         messages: [
           {
             role: 'user',
@@ -376,7 +377,7 @@ describe('paging end-to-end (transformRequest)', () => {
     const req = new TextEncoder().encode(
       JSON.stringify({
         model: 'claude-3-5-sonnet',
-        system: 'x'.repeat(60_000),
+        system: 'x'.repeat(80_000),
         messages: [
           {
             role: 'user',

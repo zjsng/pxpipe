@@ -385,7 +385,7 @@ describe('transformRequest + compressHistory', () => {
       msgs.push(i % 2 === 0 ? usr(bigPlain(3000)) : asst(bigPlain(3000)));
     }
     const before = JSON.stringify(msgs);
-    const { body } = await transformRequest(mkBody(msgs, bigPlain(60_000)));
+    const { body } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
     // Input still byte-identical to its pre-call serialization.
     expect(JSON.stringify(msgs)).toBe(before);
     // And the returned body is valid JSON we can re-parse.
@@ -401,7 +401,7 @@ describe('transformRequest + compressHistory', () => {
       const body = `turn ${i}: ` + bigPlain(2500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(60_000)), {
+    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
       compressHistory: true,
       historyKeepTail: 2,
       historyMinPrefix: 5,
@@ -432,7 +432,7 @@ describe('transformRequest + compressHistory', () => {
       asst('plain'),
       usr('plain'),
     ];
-    const { info } = await transformRequest(mkBody(msgs, bigPlain(60_000)), {
+    const { info } = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
       compressHistory: true,
       historyKeepTail: 1,
       historyMinPrefix: 2,
@@ -447,7 +447,7 @@ describe('transformRequest + compressHistory', () => {
       const body = `turn ${i}: ` + bigPlain(2500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(60_000)), {
+    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
       compressHistory: true,
       historyKeepTail: 2,
       historyMinPrefix: 5,
