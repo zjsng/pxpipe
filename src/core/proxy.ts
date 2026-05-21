@@ -8,6 +8,10 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
+import {
+  buildBaselineCountTokensBody,
+  buildCacheablePrefixCountTokensBody,
+} from './measurement.js';
 import type { Usage } from './types.js';
 
 export interface ProxyConfig {
@@ -405,156 +409,6 @@ function filterHeaders(src: Headers, strip: Set<string>): Headers {
   return out;
 }
 
-/** /v1/messages/count_tokens accepts a strict subset of /v1/messages params.
- *  Anything else (`stream`, `max_tokens`, `temperature`, `top_p`, `top_k`,
- *  `stop_sequences`, `metadata`, `service_tier`) makes it 400 with
- *  "Unknown parameter". Strip the verbatim body to the accepted fields.
- *  Returns null if the body can't be parsed or is missing required fields
- *  (probe is skipped, baseline_tokens stays absent on the event). */
-const COUNT_TOKENS_FIELDS = new Set([
-  'model',
-  'messages',
-  'system',
-  'tools',
-  'tool_choice',
-  'thinking',
-  'mcp_servers',
-]);
-
-function buildCountTokensBody(bytes: Uint8Array): Uint8Array | null {
-  try {
-    const obj = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(obj)) {
-      if (COUNT_TOKENS_FIELDS.has(k)) out[k] = obj[k];
-    }
-    if (typeof out.model !== 'string' || !Array.isArray(out.messages)) return null;
-    return new TextEncoder().encode(JSON.stringify(out));
-  } catch {
-    return null;
-  }
-}
-
-/** Type guard for content blocks that may carry a cache_control marker.
- *  Anthropic accepts `cache_control` on: any system block, any message
- *  content block, any tool definition. We don't care about the marker's
- *  value — only its presence/position. */
-function hasCacheControl(x: unknown): boolean {
-  return (
-    typeof x === 'object'
-    && x !== null
-    && (x as { cache_control?: unknown }).cache_control != null
-  );
-}
-
-/** Build a body that contains EXACTLY the tokens forming the longest
- *  cacheable prefix on the unproxied path — everything up to and INCLUDING
- *  the last `cache_control` marker in the original request, with everything
- *  after that marker stripped. count_tokens on this body returns
- *  `cacheable_prefix_tokens`; subtracting from the full count_tokens gives
- *  `cold_tail_tokens` (always-cold input on both proxied and unproxied paths).
- *
- *  Anthropic's cache-traversal order is tools → system → messages. We walk
- *  messages first (latest), then system, then tools — the FIRST one we find
- *  a marker in (walking backward) is the latest in cache order. Everything
- *  after that marker in the same section is dropped; later sections are
- *  dropped wholesale.
- *
- *  Returns null when the original body has zero `cache_control` markers
- *  anywhere — caller treats that as `cacheable_prefix_tokens = 0`. The
- *  unproxied path doesn't cache anything in that case, so the full body
- *  is cold input. */
-function buildCountTokensCacheablePrefix(bytes: Uint8Array): Uint8Array | null {
-  let obj: Record<string, unknown>;
-  try {
-    obj = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  if (typeof obj.model !== 'string') return null;
-
-  const system = obj.system;
-  const messages = obj.messages;
-  const tools = obj.tools;
-
-  // Walk messages backward; for each message walk content blocks backward.
-  // First block we hit with cache_control is the latest marker in the
-  // entire request (messages come last in cache traversal order).
-  let truncated: Record<string, unknown> | null = null;
-  if (Array.isArray(messages)) {
-    for (let mi = messages.length - 1; mi >= 0 && truncated == null; mi--) {
-      const msg = messages[mi] as { role?: unknown; content?: unknown };
-      const content = msg?.content;
-      if (Array.isArray(content)) {
-        for (let bi = content.length - 1; bi >= 0; bi--) {
-          if (hasCacheControl(content[bi])) {
-            // Truncate this message's content at and including the marker.
-            const truncatedMsg = { ...msg, content: content.slice(0, bi + 1) };
-            const truncatedMessages = messages.slice(0, mi).concat([truncatedMsg]);
-            truncated = {
-              model: obj.model,
-              messages: truncatedMessages,
-            };
-            if (system !== undefined) truncated.system = system;
-            if (tools !== undefined) truncated.tools = tools;
-            break;
-          }
-        }
-      } else if (hasCacheControl(msg)) {
-        // String-content message with a marker — keep up to this message.
-        truncated = {
-          model: obj.model,
-          messages: messages.slice(0, mi + 1),
-        };
-        if (system !== undefined) truncated.system = system;
-        if (tools !== undefined) truncated.tools = tools;
-      }
-    }
-  }
-
-  // No marker in messages — check system (next-earliest in cache order).
-  // count_tokens requires non-empty messages, so we append a 1-token sentinel
-  // user message and subtract its weight on the consumer side. Or simpler:
-  // include a single-char user message and accept ~1 token of noise.
-  if (truncated == null && Array.isArray(system)) {
-    for (let si = system.length - 1; si >= 0; si--) {
-      if (hasCacheControl(system[si])) {
-        truncated = {
-          model: obj.model,
-          system: system.slice(0, si + 1),
-          messages: [{ role: 'user', content: 'x' }],
-        };
-        if (tools !== undefined) truncated.tools = tools;
-        break;
-      }
-    }
-  }
-
-  // No marker in system — check tools (earliest in cache order). Same
-  // sentinel-message trick to keep count_tokens happy.
-  if (truncated == null && Array.isArray(tools)) {
-    for (let ti = tools.length - 1; ti >= 0; ti--) {
-      if (hasCacheControl(tools[ti])) {
-        truncated = {
-          model: obj.model,
-          tools: tools.slice(0, ti + 1),
-          messages: [{ role: 'user', content: 'x' }],
-        };
-        break;
-      }
-    }
-  }
-
-  // Filter through the same whitelist as the full-body probe to avoid 400s
-  // from stray fields slipping into the truncated copy.
-  if (truncated == null) return null;
-  const out: Record<string, unknown> = {};
-  for (const k of Object.keys(truncated)) {
-    if (COUNT_TOKENS_FIELDS.has(k)) out[k] = truncated[k];
-  }
-  return new TextEncoder().encode(JSON.stringify(out));
-}
-
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
  *  `input_tokens` number or null on any failure. count_tokens is documented
  *  as a free endpoint (no input-token billing) — we use it once per request
@@ -701,7 +555,7 @@ export function createProxy(config: ProxyConfig = {}) {
         // main /v1/messages) overlap. Anthropic doesn't bill count_tokens, so
         // the cost is wall-clock only — typically ~30-80ms, fully hidden by
         // the main forward latency.
-        const ctBody = buildCountTokensBody(bodyIn);
+        const ctBody = buildBaselineCountTokensBody(bodyIn);
         if (ctBody) {
           const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
           ctHeaders.set('content-type', 'application/json');
@@ -710,7 +564,7 @@ export function createProxy(config: ProxyConfig = {}) {
           // Second probe: body truncated at the last cache_control marker.
           // Null body = no markers exist → cacheable=0 by definition, no
           // probe needed.
-          const ctCacheableBody = buildCountTokensCacheablePrefix(bodyIn);
+          const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
           if (ctCacheableBody) {
             baselineCacheablePromise = countTokensUpstream(
               upstream,

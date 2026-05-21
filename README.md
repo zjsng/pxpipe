@@ -456,6 +456,44 @@ npx wrangler secret put ANTHROPIC_API_KEY
 
 If unset, the proxy forwards whatever `x-api-key` the client sent.
 
+
+---
+
+## Library API
+
+Pixelpipe is also published as a runtime-agnostic transform library so another
+local proxy can own auth/routing while reusing the Opus 4.7 compression and
+measurement logic directly:
+
+```ts
+import {
+  transformAnthropicMessages,
+  buildCountTokensBodies,
+  isPixelpipeSupportedModel,
+} from "pixelpipe";
+
+if (isPixelpipeSupportedModel(upstreamModel)) {
+  // Run these probes with the host proxy's own auth/transport.
+  const baseline = buildCountTokensBodies(originalMessagesBody);
+
+  const result = await transformAnthropicMessages({
+    body: originalMessagesBody,
+    model: upstreamModel,
+  });
+
+  // result.body is the body to forward; result.cache.ownsCacheControl tells
+  // the host not to stack a second cache injector on top of pixelpipe.
+}
+```
+
+Stable public exports:
+
+- `pixelpipe` — library API plus `createProxy` for standalone use.
+- `pixelpipe/transform` — `transformAnthropicMessages(...)`.
+- `pixelpipe/measurement` — count-token probe body builders.
+- `pixelpipe/applicability` — Opus 4.7 applicability helpers.
+- `pixelpipe/proxy` — standalone Web `fetch` proxy.
+
 ---
 
 ## Architecture
@@ -467,6 +505,9 @@ src/
 │   ├── png.ts           minimal grayscale PNG encoder
 │   ├── render.ts        text → PNG bytes
 │   ├── transform.ts     request body rewriter
+│   ├── library.ts       public transform wrapper for host proxies
+│   ├── measurement.ts   count_tokens probe body builders
+│   ├── applicability.ts Opus 4.7 eligibility helpers
 │   ├── proxy.ts         the fetch handler
 │   └── types.ts         Anthropic API types
 ├── node.ts            node:http adapter + CLI

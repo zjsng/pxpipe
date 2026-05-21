@@ -8,6 +8,22 @@
   },
   "exports": {
     ".": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    },
+    "./transform": {
+      "types": "./dist/core/library.d.ts",
+      "import": "./dist/core/library.js"
+    },
+    "./measurement": {
+      "types": "./dist/core/measurement.d.ts",
+      "import": "./dist/core/measurement.js"
+    },
+    "./applicability": {
+      "types": "./dist/core/applicability.d.ts",
+      "import": "./dist/core/applicability.js"
+    },
+    "./proxy": {
       "types": "./dist/core/proxy.d.ts",
       "import": "./dist/core/proxy.js"
     },

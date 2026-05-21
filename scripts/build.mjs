@@ -1,11 +1,22 @@
-// Build the Node bundle. The Worker target is built by wrangler directly
-// from src/worker.ts (no separate build step needed).
+// Build library ESM + declarations with tsc, then overwrite the Node CLI
+// entry with a bundled executable. The Worker target can still be built by
+// wrangler directly from src/worker.ts, but dist/worker.js is also emitted for
+// package consumers via tsc.
 import { build } from 'esbuild';
-import { mkdir, copyFile } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 const OUT = 'dist';
-if (!existsSync(OUT)) await mkdir(OUT, { recursive: true });
+if (existsSync(OUT)) await rm(OUT, { recursive: true, force: true });
+await mkdir(OUT, { recursive: true });
+
+const tsc = spawnSync('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], {
+  stdio: 'inherit',
+  shell: false,
+});
+if (tsc.status !== 0) process.exit(tsc.status ?? 1);
+console.log('✓ emitted dist/ library modules + declarations');
 
 await build({
   entryPoints: ['src/node.ts'],
