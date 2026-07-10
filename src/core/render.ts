@@ -181,6 +181,9 @@ export interface RenderedImage {
   height: number;
   /** Input codepoints rendered (wide chars count as 1, not 2). */
   charsRendered: number;
+  /** Exact normalized text painted onto this PNG page. Newlines reflect the
+   * renderer's wrapping/reflow, so this is diagnostic rendered source. */
+  sourceText: string;
   /** Codepoints absent from atlas, rendered as blank cells. Surface as telemetry. */
   droppedChars: number;
   /** Per-codepoint drop histogram. Empty when droppedChars === 0; never undefined. */
@@ -796,6 +799,7 @@ export async function renderChunkToPng(
 
   const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
   const fitLines = lines.slice(0, maxLines);
+  const sourceText = fitLines.join('\n');
   const fitSlotLines = slotLines ? slotLines.slice(0, maxLines) : null;
 
   // charsRendered = input codepoints covered by this image (for..of counts by codepoint, not code unit).
@@ -981,7 +985,7 @@ export async function renderChunkToPng(
   } else {
     png = await encodeGrayPng(fb, width, height);
   }
-  return { png, width, height, charsRendered, droppedChars, droppedCodepoints };
+  return { png, width, height, charsRendered, sourceText, droppedChars, droppedCodepoints };
 }
 
 /** Reflow-aware variant of renderTextToPngs. Falls back to non-reflow on sentinel collision. */
@@ -1133,6 +1137,7 @@ async function renderMultiColChunkFromLines(
     width,
     height,
     charsRendered: charsCovered,
+    sourceText: lines.join('\n'),
     droppedChars,
     droppedCodepoints,
   };

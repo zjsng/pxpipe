@@ -154,6 +154,9 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
     const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     expect(result.info.imageCount).toBeGreaterThan(0);
+    expect(result.info.imageSourceTexts).toHaveLength(result.info.imageCount);
+    expect(result.info.imageSourceTexts?.every((text) => typeof text === 'string' && text.length > 0)).toBe(true);
+    expect(result.info.imageSourceTexts?.[0]).toContain('RENDERED GPT SYSTEM + TOOL CONTEXT');
     const expectedImagedChars = `## SYSTEM MESSAGE\n${BIG_SYSTEM}\n\n${CHAT_TOOL_DOC}`.length;
     expect(result.info.origChars).toBe(expectedImagedChars);
     expect(result.info.compressedChars).toBe(expectedImagedChars);
@@ -299,6 +302,9 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     expect(result.info.imageCount).toBeGreaterThan(0);
+    expect(result.info.imageSourceTexts).toHaveLength(result.info.imageCount);
+    expect(result.info.imageSourceTexts?.every((text) => typeof text === 'string' && text.length > 0)).toBe(true);
+    expect(result.info.imageSourceTexts?.[0]).toContain('RENDERED GPT SYSTEM + TOOL CONTEXT');
     expect(result.info.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
     const expectedImagedChars = `## INSTRUCTIONS\n${BIG_INSTRUCTIONS}\n\n${RESPONSES_TOOL_DOC}`.length;
     expect(result.info.origChars).toBe(expectedImagedChars);
