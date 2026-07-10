@@ -172,6 +172,8 @@ describe('serveFragment', () => {
     const off = await dash.serveFragment('toggle', url, 1234);
     const offHtml = await off.text();
     expect(offHtml).toContain('PASSTHROUGH MODE');
+    expect(offHtml).toContain('GPT and Claude requests still travel through pxpipe');
+    expect(offHtml).toContain("restore the client's original API base URL");
     expect(offHtml).toContain('Enable compression');
     dash.handleCompressionToggle({ enabled: true });
   });

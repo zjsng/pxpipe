@@ -31,6 +31,11 @@ export interface ProxyConfig {
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
    *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
+  /** Maximum concurrent OpenAI generation requests forwarded upstream.
+   *  Undefined/0 disables the gate. The Node host defaults this to 3 because
+   *  the ChatGPT Codex backend develops multi-minute account queues under
+   *  higher fan-out. Slots are held until the response body reaches EOF. */
+  openAIConcurrency?: number;
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
 }
@@ -45,6 +50,16 @@ export interface ProxyEvent {
   durationMs: number;
   /** Wall-clock ms from request start to upstream response headers. */
   firstByteMs?: number;
+  /** Time spent in pxpipe's request transform, excluding local queueing. */
+  transformMs?: number;
+  /** Time spent waiting for pxpipe's OpenAI concurrency gate. */
+  queueMs?: number;
+  /** Time from starting the upstream fetch to receiving response headers. */
+  upstreamFirstByteMs?: number;
+  /** Active OpenAI generation requests immediately after this request acquired a slot. */
+  upstreamConcurrency?: number;
+  /** One-based local queue position on arrival; 0 means it acquired immediately. */
+  queueDepth?: number;
   info?: TransformInfo;
   /** Usage block from Anthropic's response — input/output/cache tokens. */
   usage?: Usage;
@@ -70,6 +85,53 @@ export interface ProxyEvent {
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
+
+/** Small FIFO semaphore used only for expensive OpenAI generation routes.
+ * Model discovery and Anthropic traffic bypass it. Holding the slot through
+ * response EOF prevents a burst of header-complete streaming responses from
+ * defeating the limit. */
+class ConcurrencyGate {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly max: number) {}
+
+  get activeCount(): number { return this.active; }
+  get queuedCount(): number { return this.waiters.length; }
+
+  acquire(signal?: AbortSignal): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      let started = false;
+      const start = (): void => {
+        if (signal?.aborted) {
+          reject(new Error('request aborted while waiting for upstream slot'));
+          return;
+        }
+        started = true;
+        this.active++;
+        signal?.removeEventListener('abort', onAbort);
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          this.active--;
+          this.waiters.shift()?.();
+        });
+      };
+      const onAbort = (): void => {
+        if (started) return;
+        const i = this.waiters.indexOf(start);
+        if (i >= 0) this.waiters.splice(i, 1);
+        reject(new Error('request aborted while waiting for upstream slot'));
+      };
+      if (this.active < this.max) start();
+      else {
+        this.waiters.push(start);
+        signal?.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+}
 
 /** Read the top-level `model` field from a /v1/messages body without parsing the full JSON.
  *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
@@ -553,7 +615,10 @@ function isOpenAIResponsesPath(pathname: string): boolean {
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
-  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
+  const isModelsPath = pathname === '/models'
+    || pathname.startsWith('/models/')
+    || pathname === '/v1/models'
+    || pathname.startsWith('/v1/models/');
   const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
   return pathname === '/v1/chat/completions'
     || pathname === '/responses'
@@ -637,6 +702,10 @@ export function createProxy(config: ProxyConfig = {}) {
     ? (config.gatewayBaseUrl ?? '').replace(/\/+$/, '')
     : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
+  const configuredConcurrency = Math.floor(config.openAIConcurrency ?? 0);
+  const openAIGate = configuredConcurrency > 0
+    ? new ConcurrencyGate(configuredConcurrency)
+    : undefined;
   const applyGatewayHeaders = (h: Headers): Headers => {
     for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
     return h;
@@ -650,6 +719,11 @@ export function createProxy(config: ProxyConfig = {}) {
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
+    let transformMs: number | undefined;
+    let queueMs: number | undefined;
+    let upstreamFirstByteMs: number | undefined;
+    let upstreamConcurrency: number | undefined;
+    let queueDepth: number | undefined;
 
     const fire = (
       status: number,
@@ -713,6 +787,11 @@ export function createProxy(config: ProxyConfig = {}) {
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
+          transformMs,
+          queueMs,
+          upstreamFirstByteMs,
+          upstreamConcurrency,
+          queueDepth,
           info,
           usage,
           error,
@@ -753,6 +832,7 @@ export function createProxy(config: ProxyConfig = {}) {
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
+        const transformStarted = Date.now();
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
@@ -771,6 +851,7 @@ export function createProxy(config: ProxyConfig = {}) {
           : isOpenAIChat
             ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
             : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        transformMs = Date.now() - transformStarted;
         if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
@@ -830,7 +911,28 @@ export function createProxy(config: ProxyConfig = {}) {
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
     const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
     const upstreamUrl = upstreamBase + outPath;
+    let releaseUpstream: (() => void) | undefined;
+    if (openAIGate && (isOpenAIChat || isOpenAIResponses)) {
+      queueDepth = openAIGate.activeCount >= configuredConcurrency
+        ? openAIGate.queuedCount + 1
+        : 0;
+      const queueStarted = Date.now();
+      try {
+        releaseUpstream = await openAIGate.acquire(req.signal);
+      } catch {
+        queueMs = Date.now() - queueStarted;
+        fire(499, info, 'request_aborted_while_queued');
+        return new Response(JSON.stringify({ error: 'request aborted while queued' }), {
+          status: 499,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      queueMs = Date.now() - queueStarted;
+      upstreamConcurrency = openAIGate.activeCount;
+    }
+
     let upstreamRes: Response;
+    const upstreamStarted = Date.now();
     try {
       upstreamRes = await fetch(upstreamUrl, {
         method: req.method,
@@ -840,6 +942,7 @@ export function createProxy(config: ProxyConfig = {}) {
         ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
       } as RequestInit);
     } catch (e) {
+      releaseUpstream?.();
       fire(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
@@ -847,6 +950,7 @@ export function createProxy(config: ProxyConfig = {}) {
       });
     }
 
+    upstreamFirstByteMs = Date.now() - upstreamStarted;
     const firstByteMs = Date.now() - t0;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
@@ -860,9 +964,10 @@ export function createProxy(config: ProxyConfig = {}) {
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
       modelPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason, resolvedModel]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason, resolvedModel),
-    );
+    ]).then(([usage, errorBody, measurement, stopReason, resolvedModel]) => {
+      releaseUpstream?.();
+      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason, resolvedModel);
+    });
 
     return new Response(teed.body, {
       status: upstreamRes.status,

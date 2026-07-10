@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
 import { openAIVisionTokens, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
+import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -71,7 +72,9 @@ describe('openAIVisionTokens', () => {
 const BIG_SYSTEM = 'System instruction with lots of detail. '.repeat(500); // ~20k chars
 const BIG_TOOL_DESC = 'Tool description with lots of context. '.repeat(200); // ~8k chars
 const CHAT_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const CHAT_TOOL_DOC = `## Tool: do_thing\n${BIG_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(CHAT_TOOL_PARAMS)}\n\`\`\``;
+const CHAT_TOOL_DOC = '## Stripped schema annotations for tool: do_thing\n' +
+  '$.description: Param root.\n' +
+  '$.properties.x.description: x param';
 
 // Real `task`/`question` tools have a required parameter literally NAMED `description`
 // (others collide with `title`/`default`). The strip must drop the annotation but KEEP
@@ -82,9 +85,9 @@ const CHAT_TOOL_DOC = `## Tool: do_thing\n${BIG_TOOL_DESC}\n\`\`\`json\n${JSON.s
 const TASK_LIKE_PARAMS = {
   type: 'object',
   properties: {
-    description: { type: 'string', description: 'A short (3-5 words) description of the task' },
-    prompt: { type: 'string', description: 'The task for the agent to perform' },
-    title: { type: 'string', description: 'Property name collides with the title keyword' },
+    description: { type: 'string', description: 'A short (3-5 words) description of the task. '.repeat(80) },
+    prompt: { type: 'string', description: 'The task for the agent to perform. '.repeat(80) },
+    title: { type: 'string', description: 'Property name collides with the title keyword. '.repeat(80) },
   },
   required: ['description', 'prompt'],
   additionalProperties: false,
@@ -144,7 +147,7 @@ describe('transformOpenAIChatCompletions (gpt-5.6)', () => {
     expect(tools[0]!.function.parameters?.properties?.x?.description).toBeUndefined();
   });
 
-  it('images GPT tool definitions even when there is no instruction context', async () => {
+  it('does not image tool prose that remains losslessly available in native definitions', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6',
       messages: [{ role: 'user', content: 'hello' }],
@@ -159,12 +162,13 @@ describe('transformOpenAIChatCompletions (gpt-5.6)', () => {
     }));
 
     const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
-    expect(result.info.origChars).toBe(CHAT_TOOL_DOC.length);
-    expect(result.info.compressedChars).toBe(CHAT_TOOL_DOC.length);
+    // The long top-level description stays native. Only two tiny schema
+    // annotations are removable, which is below one image's break-even point.
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toMatch(/not_profitable|below_min_chars/);
     const out = JSON.parse(dec.decode(result.body)) as any;
     expect(out.tools[0].function.description).toBe(BIG_TOOL_DESC);
-    expect(out.tools[0].function.parameters.description).toBeUndefined();
+    expect(out.tools[0].function.parameters.description).toBe('Param root.');
   });
 
   it('keeps a parameter literally named "description" (task-tool regression)', async () => {
@@ -212,7 +216,9 @@ describe('transformOpenAIChatCompletions (gpt-5.6)', () => {
 const BIG_INSTRUCTIONS = 'These are detailed instructions. '.repeat(600); // ~20k chars
 const BIG_FLAT_TOOL_DESC = 'Flat tool description with lots of context. '.repeat(200); // ~8k chars
 const RESPONSES_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const RESPONSES_TOOL_DOC = `## Tool: do_thing\n${BIG_FLAT_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(RESPONSES_TOOL_PARAMS)}\n\`\`\``;
+const RESPONSES_TOOL_DOC = '## Stripped schema annotations for tool: do_thing\n' +
+  '$.description: Param root.\n' +
+  '$.properties.x.description: x param';
 
 describe('transformOpenAIResponses (gpt-5.6)', () => {
   it('compresses GPT Responses instructions + tool docs while preserving native tool selection metadata', async () => {
@@ -291,7 +297,7 @@ describe('transformOpenAIResponses (gpt-5.6)', () => {
     expect(JSON.stringify(dev.content)).not.toContain('These are detailed');
   });
 
-  it('images GPT Responses tool definitions even when there is no instruction context', async () => {
+  it('does not image Responses tool prose that remains losslessly available natively', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6',
       input: [{ role: 'user', content: 'Please do the thing.' }],
@@ -304,12 +310,11 @@ describe('transformOpenAIResponses (gpt-5.6)', () => {
     }));
 
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
-    expect(result.info.origChars).toBe(RESPONSES_TOOL_DOC.length);
-    expect(result.info.compressedChars).toBe(RESPONSES_TOOL_DOC.length);
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toMatch(/not_profitable|below_min_chars/);
     const out = JSON.parse(dec.decode(result.body)) as any;
     expect(out.tools[0].description).toBe(BIG_FLAT_TOOL_DESC);
-    expect(out.tools[0].parameters.description).toBeUndefined();
+    expect(out.tools[0].parameters.description).toBe('Param root.');
   });
 
   it('keeps a parameter literally named "description" (task-tool regression)', async () => {
@@ -472,6 +477,37 @@ function buildChatMessages(turns: number): Array<Record<string, unknown>> {
 }
 
 describe('transformOpenAIResponses — history collapse', () => {
+  it('uses GPT page geometry and exact tokens for newline-heavy history', async () => {
+    const input: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 50; i++) {
+      const id = `c${i}`;
+      input.push({ role: 'user', content: `Request ${i}\npath: /Users/a/src/f${i}.ts\nDo x.` });
+      input.push({ role: 'assistant', content: `I will do step ${i}.\nReading now.\nThen patch.` });
+      input.push({
+        type: 'function_call',
+        call_id: id,
+        name: 'read',
+        arguments: JSON.stringify({ path: `/Users/a/src/f${i}.ts`, line_start: 1, line_end: 200 }),
+      });
+      input.push({
+        type: 'function_call_output',
+        call_id: id,
+        output: Array.from({ length: 30 }, (_, j) => `${j + 1}: const value_${j} = ${j};`).join('\n'),
+      });
+    }
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      instructions: 'System rule. '.repeat(5000),
+      input,
+    }));
+
+    const result = await transformOpenAIResponses(body);
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
+    expect(result.info.baselineImagedTokens ?? 0).toBeGreaterThan(result.info.imageTokens ?? 0);
+  });
+
   it('collapses the OLD transcript prefix into history images, keeps the tail as text', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6',
@@ -710,11 +746,9 @@ describe('GPT history collapse — pins the live request as text (autonomous sha
 });
 
 // ── Vision cost: gpt-5.x FLAGSHIP patch model (multiplier 1.0, original detail) ──
-// Per OpenAI docs (patch tokenization): flagship gpt-5.4/5.5/5.6 have NO listed
-// multiplier (= 1.0); the 1.62/2.46 values are mini/nano ONLY. And `detail:original`
-// (gpt-5.5's default) gives a 10,000-patch / 6000px budget vs `high`'s 2,500 / 2048px.
-// pxpipe renders dense text, so it must use the LARGER budget or OpenAI downscales
-// the image and the text becomes unreadable.
+// Per OpenAI docs (patch tokenization), GPT-5.6 original/auto uses the original
+// patch count with no resize, pixel limit, or patch budget. Sol/Terra/Luna share
+// that tokenizer; their different credit rates are scalar pricing differences.
 describe('openAIVisionTokens — gpt-5.x flagship patch model', () => {
   it('flagship multiplier is 1.0, not the mini 1.62', () => {
     // 768x1932 → patches = ceil(768/32)*ceil(1932/32) = 24*61 = 1464; ×1.0 = 1464.
@@ -722,19 +756,32 @@ describe('openAIVisionTokens — gpt-5.x flagship patch model', () => {
     expect(openAIVisionTokens('gpt-5.5', 768, 1932)).toBe(1464);
   });
 
-  it('flagship patch budget is 10,000 (original detail), not 2,500', () => {
-    // 4000x4000 → patches = 125*125 = 15625, capped at the budget.
-    // Pre-fix (cap 2500, ×1.62) this returned 4050; correct is min(15625,10000)=10000.
-    expect(openAIVisionTokens('gpt-5.6', 4000, 4000)).toBe(10000);
+  it('does not cap GPT-5.6 original-detail patches', () => {
+    // 4000x4000 → 125*125 = 15,625 patches, with no service-side resize/cap.
+    expect(openAIVisionTokens('gpt-5.6', 4000, 4000)).toBe(15625);
+    expect(openAIVisionTokens('gpt-5.6-sol', 4000, 4000)).toBe(15625);
+    expect(openAIVisionTokens('gpt-5.6-terra', 4000, 4000)).toBe(15625);
+    expect(openAIVisionTokens('gpt-5.6-luna', 4000, 4000)).toBe(15625);
   });
 
-  it('resolveVisionCost flagship = patch, multiplier 1, cap 10000; mini stays 1.62/1536', () => {
-    expect(resolveVisionCost('gpt-5.6')).toMatchObject({ regime: 'patch', multiplier: 1, patchCap: 10000 });
+  it('resolves GPT-5.6 as uncapped patch cost; older flagship and mini caps stay intact', () => {
+    expect(resolveVisionCost('gpt-5.6')).toEqual({ regime: 'patch', multiplier: 1 });
+    expect(resolveVisionCost('gpt-5.6-sol')).toEqual({ regime: 'patch', multiplier: 1 });
     expect(resolveVisionCost('gpt-5.5')).toMatchObject({ regime: 'patch', multiplier: 1, patchCap: 10000 });
     expect(resolveVisionCost('gpt-5.6-mini')).toMatchObject({ regime: 'patch', multiplier: 1.62, patchCap: 1536 });
     expect(resolveVisionCost('gpt-5.6-nano')).toMatchObject({ regime: 'patch', multiplier: 2.46, patchCap: 1536 });
     // mini at 768x1932: patches 1464 (<1536) × 1.62 = ceil(2371.68) = 2372 (unchanged).
     expect(openAIVisionTokens('gpt-5.6-mini', 768, 1932)).toBe(2372);
+  });
+
+  it('uses a patch-aligned full-page geometry for every GPT-5.6 class', () => {
+    for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      const profile = resolveGptProfile(model);
+      expect(profile.stripCols).toBe(152); // 8px padding + 152*5px = 768 = 24 patches
+      expect(profile.maxHeightPx).toBe(2624); // 82 exact 32px patch bands
+      expect(profile.historySectionTokens).toBe(2000);
+      expect(openAIVisionTokens(model, 768, 2624)).toBe(24 * 82);
+    }
   });
 });
 

@@ -35,6 +35,30 @@ Source of truth: `renderChunkToPng` in `src/core/render.ts` (the `width` /
 cell"), `DEFAULT_COLS=313`, `DENSE_CONTENT_COLS=384`, `MAX_HEIGHT_PX=1932`,
 `READABLE_CHARS_PER_IMAGE=50000`, `DENSE_CONTENT_CHARS_PER_IMAGE=92160`.
 
+### GPT-5.6 (Sol, Terra, Luna)
+
+The OpenAI path has its own model profile and does not use the Anthropic/Fable
+resize ceiling above. pxpipe sends GPT images with `detail: "original"`.
+OpenAI documents GPT-5.6 original/auto images as uncapped patch inputs: billed
+tokens are the original `ceil(width/32) × ceil(height/32)` patch count, with no
+service-side resize, pixel-dimension limit, or patch-budget clamp. See the
+[OpenAI image-cost guide](https://developers.openai.com/api/docs/guides/images-vision#calculating-costs).
+
+pxpipe therefore uses a 768px-wide strip (`8 + 152·5`), exactly 24 patches,
+and a 2624px full-page height, exactly 82 patches. The 327 text rows hold up to
+49,704 characters, immediately below the renderer's existing 50k readability
+limit. A full page costs 1,968 image tokens, or about 25.26 rendered characters
+per image token. The former 768×1928 full page cost 1,464 tokens for 36,480
+characters, about 24.92 chars/token, and required more physical images.
+
+The savings gate compares this exact patch cost with an exact `o200k_base` count
+of the text being replaced. Sol, Terra, and Luna use the same geometry because
+their input and cached-input credit rates are scalar multiples; changing model
+price does not change the token break-even point. Frozen history sections remain
+at 2,000 text tokens to preserve early profitable collapse and stable prefix
+caching. `PXPIPE_GPT_PROFILES` can override geometry or section size for measured
+experiments without a code change.
+
 ## The cell
 
 Each character occupies a **5px wide × 8px tall** cell (`ATLAS_CELL_W=5`,

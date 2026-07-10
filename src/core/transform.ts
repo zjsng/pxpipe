@@ -33,6 +33,7 @@ import {
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
   renderTextToPngsWithCharLimit,
+  wrapLines,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
@@ -1065,23 +1066,11 @@ function lineRows(line: string, cols: number): number {
   return Math.max(1, Math.ceil(line.length / cols));
 }
 
-/** Visual row count after soft-wrap at `cols`. Both `\n` and the ↵ sentinel
- *  end a row; ↵ occupies a cell on the line it terminates. */
+/** Visual row count after the renderer's minification and soft-wrap. The ↵
+ * sentinel is an inline glyph, not a row break (render.ts wrapLines is the
+ * source of truth). */
 function countVisualRows(text: string, cols: number): number {
-  let rows = 0;
-  let lineStart = 0;
-  const len = text.length;
-  for (let i = 0; i <= len; i++) {
-    const cc = i < len ? text.charCodeAt(i) : -1;
-    const isSentinel = cc === 0x21b5 /* ↵ */;
-    if (i === len || cc === 10 /* \n */ || isSentinel) {
-      // ↵ renders as a glyph on the line it ends — count it in the length.
-      const lineLen = (isSentinel ? i + 1 : i) - lineStart;
-      rows += Math.max(1, Math.ceil(lineLen / cols));
-      lineStart = i + 1;
-    }
-  }
-  return rows;
+  return wrapLines(text, cols).length;
 }
 
 /** Estimate how many images `text` will render to at the given column width.
