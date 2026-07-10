@@ -298,6 +298,53 @@ describe('proxy usage extraction', () => {
     expect(captured?.info?.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
   });
 
+  it('transforms Codex /responses requests and preserves subscription auth headers', async () => {
+    const upstreamRequests: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      upstreamRequests.push(req.clone());
+      return new Response(
+        JSON.stringify({
+          id: 'resp_codex',
+          object: 'response',
+          output: [],
+          usage: { input_tokens: 55, output_tokens: 7, total_tokens: 62 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/responses', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer subscription-token',
+          'chatgpt-account-id': 'account-id',
+        },
+        body: JSON.stringify({
+          model: 'gpt-5.6-sol',
+          instructions: 'System instruction. '.repeat(900),
+          input: [{ role: 'user', content: 'hi' }],
+        }),
+      }),
+    );
+    await res.text();
+    restore();
+
+    expect(upstreamRequests).toHaveLength(1);
+    expect(upstreamRequests[0]!.url).toBe('https://chatgpt.com/backend-api/codex/responses');
+    expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer subscription-token');
+    expect(upstreamRequests[0]!.headers.get('chatgpt-account-id')).toBe('account-id');
+    const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
+    const firstUser = sent.input.find((m: any) => m.role === 'user');
+    expect(firstUser.content[0].type).toBe('input_image');
+  });
+
   it('extracts usage tokens from an SSE stream (message_start event)', async () => {
     const sseBody =
       'event: message_start\n' +
@@ -353,6 +400,65 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.usage?.input_tokens).toBe(42);
     expect(captured!.usage?.cache_creation_input_tokens).toBe(5000);
+  });
+
+  it('extracts Responses usage from Codex data-only SSE events', async () => {
+    // chatgpt.com/backend-api/codex omits the SSE `event:` line and puts the
+    // event name in data.type instead. This is the shape used by the Codex app.
+    const sseBody =
+      'data: ' + JSON.stringify({
+        type: 'response.output_text.delta',
+        delta: 'hello',
+      }) + '\r\n\r\n' +
+      'data: ' + JSON.stringify({
+        type: 'response.completed',
+        response: {
+          status: 'completed',
+          usage: {
+            input_tokens: 321,
+            input_tokens_details: { cached_tokens: 200 },
+            output_tokens: 17,
+            total_tokens: 338,
+          },
+        },
+      }) + '\r\n\r\n';
+
+    const restore = mockUpstream(
+      () => new Response(sseBody, {
+        status: 200,
+        // chatgpt.com/backend-api/codex currently omits Content-Type.
+      }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+      transform: {},
+      onRequest: (e) => {
+        captured = e;
+      },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
+        body: JSON.stringify({
+          model: 'gpt-5.6-sol',
+          instructions: 'short',
+          input: [{ role: 'user', content: 'hi' }],
+        }),
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.usage?.input_tokens).toBe(321);
+    expect(captured!.usage?.cached_tokens).toBe(200);
+    expect(captured!.usage?.output_tokens).toBe(17);
+    expect(captured!.stopReason).toBe('stop');
   });
 
   it('fires the event with undefined usage when the response is an error', async () => {

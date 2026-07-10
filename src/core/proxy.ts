@@ -136,6 +136,14 @@ function processSseEvent(
   }
   const obj = j as Record<string, unknown>;
 
+  // The public Responses API normally sends an explicit SSE `event:` line,
+  // but the subscription-backed Codex endpoint sends data-only SSE blocks and
+  // carries the event name in the JSON `type` field.  Without this fallback we
+  // forward the response correctly but never see the terminal
+  // `response.completed` usage object, leaving the dashboard with request
+  // rows but no token/savings statistics.
+  if (!event && typeof obj.type === 'string') event = obj.type;
+
   // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
   const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
   if (openAIUsage) state.usage = openAIUsage;
@@ -389,7 +397,12 @@ function teeForUsage(res: Response): {
     let buf = '';
 
     try {
-      if (ct.includes('text/event-stream')) {
+      // The subscription-backed Codex endpoint currently omits Content-Type
+      // entirely even though the body is a Responses SSE stream. Treat every
+      // non-JSON 2xx API response as an event stream; these endpoints only
+      // return JSON or SSE, and this also covers proxies that rewrite the
+      // missing type to text/plain.
+      if (!ct.includes('application/json')) {
         // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
         const m: OutputMeasurement = {
           textChars: 0,
@@ -405,11 +418,13 @@ function teeForUsage(res: Response): {
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line.
-          let evEnd: number;
-          while ((evEnd = buf.indexOf('\n\n')) >= 0) {
-            const block = buf.slice(0, evEnd);
-            buf = buf.slice(evEnd + 2);
+          // SSE permits LF or CRLF line endings. The Codex subscription
+          // endpoint uses CRLF, so looking only for `\n\n` leaves the entire
+          // stream as one invalid concatenated JSON block and drops usage.
+          let boundary: RegExpExecArray | null;
+          while ((boundary = /\r?\n\r?\n/.exec(buf)) !== null) {
+            const block = buf.slice(0, boundary.index);
+            buf = buf.slice(boundary.index + boundary[0].length);
             processSseEvent(block, m, state);
           }
         }
@@ -513,7 +528,8 @@ function isOpenAIChatPath(pathname: string): boolean {
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
-  return pathname === '/v1/responses'
+  return pathname === '/responses'
+    || pathname === '/v1/responses'
     || pathname === '/openai/v1/responses'
     || pathname === '/openai/responses';
 }
@@ -522,6 +538,7 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
   const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
   return pathname === '/v1/chat/completions'
+    || pathname === '/responses'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
     || (isModelsPath && looksOpenAIAuth);
