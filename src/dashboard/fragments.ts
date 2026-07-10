@@ -56,10 +56,10 @@ export function renderToggleFragment(enabled: boolean): string {
   // NOTE: "PASSTHROUGH MODE", "Disable compression", "Enable compression" are asserted by tests.
   const banner = enabled
     ? ''
-    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every request goes to Claude unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
+    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. GPT and Claude requests still travel through pxpipe, but their request bodies are forwarded to the configured upstream unchanged: no images, no savings. To bypass pxpipe itself, restore the client's original API base URL.</div>`;
   // Button POSTs the OPPOSITE of current state; 2s poll keeps it fresh.
   const confirm = enabled
-    ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
+    ? ` hx-confirm="Turn compression off?\n\nGPT and Claude request bodies will pass through pxpipe unchanged. Traffic will still connect through pxpipe; bypassing it requires restoring the client's original API base URL. Restarting pxpipe turns compression back on."`
     : '';
   return (
     banner +
@@ -68,7 +68,7 @@ export function renderToggleFragment(enabled: boolean): string {
     `<button class="switch-btn" type="button" hx-post="/fragments/toggle" hx-target="#frag-toggle" hx-vals='{"enabled": ${!enabled}}'${confirm}>` +
     (enabled ? 'Disable compression' : 'Enable compression') +
     `</button>` +
-    `<span class="hint">kill switch · resets to on when you restart</span>` +
+    `<span class="hint">transform kill switch · traffic still uses pxpipe · resets to on when you restart</span>` +
     `</div>`
   );
 }
