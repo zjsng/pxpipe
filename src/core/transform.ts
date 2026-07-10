@@ -539,6 +539,9 @@ export interface TransformInfo {
   /** All rendered PNGs this request. Dashboard only; NOT persisted to JSONL. */
   imagePngs?: Uint8Array[];
   imageDims?: Array<{ width: number; height: number }>;
+  /** Per-page rendered source, index-aligned with imagePngs/imageDims. Dashboard
+   * only; NOT persisted. Entries may be absent for legacy/custom renderers. */
+  imageSourceTexts?: Array<string | undefined>;
   /** Source text rendered to images (slab + header), capped at 64 KiB. NOT persisted. */
   imageSourceText?: string;
   reminderImgs?: number;

@@ -2381,4 +2381,12 @@ describe('colorByRole (structure-through slot string)', () => {
     expect(colored.png[25]).toBe(2); // 2 = truecolor RGB
     expect(plain.png[25]).toBe(0); // 0 = grayscale
   });
+
+  it('keeps the exact normalized source text for each rendered page', async () => {
+    const images = await renderTextToPngs('alpha beta gamma delta', 8, {}, 20);
+    expect(images.length).toBeGreaterThan(1);
+    expect(images.every((image) => image.sourceText.length > 0)).toBe(true);
+    expect(images.map((image) => image.sourceText).join('\n')).toContain('alpha');
+    expect(images.map((image) => image.sourceText).join('\n')).toContain('delta');
+  });
 });

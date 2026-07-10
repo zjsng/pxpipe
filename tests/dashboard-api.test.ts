@@ -230,6 +230,27 @@ describe('serveFragment', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 
+  it('shows the source captured for the selected image page', async () => {
+    const ids = dash.captureImage({
+      imagePngs: [
+        new Uint8Array([137, 80, 78, 71, 1]),
+        new Uint8Array([137, 80, 78, 71, 2]),
+      ],
+      imageDims: [
+        { width: 100, height: 80 },
+        { width: 100, height: 80 },
+      ],
+      imageSourceTexts: ['first page source', 'second page source'],
+    } as never);
+
+    const srcUrl = new URL(`http://localhost/fragments/latest?pin=${ids[1]}&source=1`);
+    const html = await (await dash.serveFragment('latest', srcUrl, 1)).text();
+    expect(html).toContain('second page source');
+    expect(html).not.toContain('first page source');
+    expect(html).not.toContain("source text wasn't captured");
+    expect(html).toContain('Text rendered on this page');
+  });
+
   it('404s unknown fragments', async () => {
     const res = await dash.serveFragment('nope', url, 1);
     expect(res.status).toBe(404);

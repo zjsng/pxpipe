@@ -534,7 +534,7 @@ export class DashboardState {
         width,
         height,
         ts: Date.now() / 1000,
-        sourceText: info.imageSourceText,
+        sourceText: info.imageSourceTexts?.[i] ?? info.imageSourceText,
       });
       ids.push(id);
     }

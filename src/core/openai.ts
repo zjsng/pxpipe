@@ -566,6 +566,10 @@ function foldGptHistory(
     ...(info.imageDims ?? []),
     ...allImages.map((i) => ({ width: i.width, height: i.height })),
   ];
+  info.imageSourceTexts = [
+    ...(info.imageSourceTexts ?? []),
+    ...allImages.map((i) => i.sourceText),
+  ];
   if (plan.droppedChars > 0) info.droppedChars = (info.droppedChars ?? 0) + plan.droppedChars;
   info.collapsedTurns = plan.collapsedTurns;
   info.collapsedChars = plan.collapsedChars;
@@ -700,6 +704,7 @@ export async function transformOpenAIChatCompletions(
   info.firstImageHeight = images[0]!.height;
   info.imagePngs = images.map((img) => img.png);
   info.imageDims = images.map((img) => ({ width: img.width, height: img.height }));
+  info.imageSourceTexts = images.map((img) => img.sourceText);
 
   // Verbatim fact-sheet: precision-critical tokens (paths, ids, versions, flags)
   // pulled from the pre-image text so exact strings survive OCR loss. Deterministic
@@ -905,6 +910,7 @@ export async function transformOpenAIResponses(
   info.firstImageHeight = images[0]!.height;
   info.imagePngs = images.map((img) => img.png);
   info.imageDims = images.map((img) => ({ width: img.width, height: img.height }));
+  info.imageSourceTexts = images.map((img) => img.sourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
   const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
