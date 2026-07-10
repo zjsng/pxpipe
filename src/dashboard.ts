@@ -468,8 +468,10 @@ export class DashboardState {
    *  stays dangling on its RecentRow rather than pointing at a new image. */
   private nextImageId = 1;
   /** Runtime kill switch for compression. When false, the proxy forwards
-   *  /v1/messages unchanged to upstream — pure passthrough, no images,
-   *  no transforms. Controlled by the dashboard "passthrough" toggle so
+   *  supported Anthropic and OpenAI request bodies unchanged to upstream —
+   *  pure passthrough, no images, no transforms. Requests still travel through
+   *  pxpipe; changing the client's configured API base URL is the only way to
+   *  bypass the proxy transport itself. Controlled by the dashboard toggle so
    *  the operator can toggle the proxy's transform instantly.
    *
    *  Defaults to TRUE since 2026-06-09: scope is Fable 5 only, which reads
