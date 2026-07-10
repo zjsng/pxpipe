@@ -48,6 +48,7 @@ interface RuntimeConfig {
   provider?: 'cloudflare-ai-gateway';
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
+  openAIConcurrency: number;
   eventsFile: string;
 }
 
@@ -114,10 +115,17 @@ function parseCli(argv: string[]): RuntimeConfig {
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
+    openAIConcurrency: parseNonNegativeInt(process.env.PXPIPE_OPENAI_CONCURRENCY, 3),
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
   };
+}
+
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
 }
 
 function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
@@ -156,6 +164,8 @@ Environment:
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+  PXPIPE_OPENAI_CONCURRENCY
+                          max concurrent OpenAI generations (default 3; 0 disables)
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
@@ -933,6 +943,7 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    openAIConcurrency: opts.openAIConcurrency,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1071,6 +1082,7 @@ async function main(): Promise<void> {
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    console.log(`[pxpipe] openai concurrency → ${opts.openAIConcurrency || 'unlimited'}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });

@@ -17,6 +17,12 @@ export interface TrackEvent {
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
+  transform_ms?: number;
+  queue_ms?: number;
+  upstream_first_byte_ms?: number;
+  upstream_concurrency?: number;
+  /** One-based local queue position on arrival; 0 means immediate acquisition. */
+  queue_depth?: number;
 
   // From TransformInfo:
   compressed?: boolean;
@@ -178,6 +184,11 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   };
   if (ev.model) out.model = ev.model;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
+  if (ev.transformMs !== undefined) out.transform_ms = ev.transformMs;
+  if (ev.queueMs !== undefined) out.queue_ms = ev.queueMs;
+  if (ev.upstreamFirstByteMs !== undefined) out.upstream_first_byte_ms = ev.upstreamFirstByteMs;
+  if (ev.upstreamConcurrency !== undefined) out.upstream_concurrency = ev.upstreamConcurrency;
+  if (ev.queueDepth !== undefined) out.queue_depth = ev.queueDepth;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;

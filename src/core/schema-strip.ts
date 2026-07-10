@@ -83,6 +83,79 @@ const SCHEMA_VERBATIM_KEYS = new Set([
 /** Real `format` tokens (date-time, uri, email…) are short; anything longer is a description. */
 const FORMAT_MAX_LEN = 32;
 
+/** One annotation removed by {@link stripSchemaDescriptions}, with enough path
+ * context for the model to associate the prose with the native schema that
+ * remains in tools[]. */
+export interface SchemaAnnotation {
+  path: string;
+  key: string;
+  value: unknown;
+}
+
+function pathKey(path: string, key: string): string {
+  return /^[A-Za-z_$][\w$-]*$/.test(key)
+    ? `${path}.${key}`
+    : `${path}[${JSON.stringify(key)}]`;
+}
+
+/**
+ * Extract only the schema metadata that stripSchemaDescriptions removes.
+ *
+ * GPT keeps the validation skeleton in native tools[], so rendering that same
+ * skeleton again wastes image patches. This path-qualified list is the exact
+ * complementary payload: descriptions/defaults/examples remain readable in
+ * the image, while types/properties/required/enums continue to ride natively.
+ */
+export function extractSchemaAnnotations(
+  node: unknown,
+  path = '$',
+  depth = 0,
+): SchemaAnnotation[] {
+  if (depth > SCHEMA_STRIP_MAX_DEPTH || !node || typeof node !== 'object') return [];
+  if (Array.isArray(node)) {
+    return node.flatMap((v, i) => extractSchemaAnnotations(v, `${path}[${i}]`, depth + 1));
+  }
+
+  const out: SchemaAnnotation[] = [];
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (SCHEMA_STRIP_KEYS.has(k) || (k === 'format' && typeof v === 'string' && v.length > FORMAT_MAX_LEN)) {
+      out.push({ path, key: k, value: v });
+      continue;
+    }
+
+    if (
+      SCHEMA_NAMED_SUBSCHEMA_KEYS.has(k)
+      && v
+      && typeof v === 'object'
+      && !Array.isArray(v)
+    ) {
+      for (const [name, sub] of Object.entries(v as Record<string, unknown>)) {
+        out.push(...extractSchemaAnnotations(sub, pathKey(pathKey(path, k), name), depth + 1));
+      }
+      continue;
+    }
+
+    if (SCHEMA_COMPOSITION_KEYS.has(k) && Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) {
+        out.push(...extractSchemaAnnotations(v[i], `${pathKey(path, k)}[${i}]`, depth + 1));
+      }
+      continue;
+    }
+
+    if (SCHEMA_SINGLE_SUBSCHEMA_KEYS.has(k)) {
+      out.push(...extractSchemaAnnotations(v, pathKey(path, k), depth + 1));
+      continue;
+    }
+
+    // Match stripSchemaDescriptions' conservative recursion for vendor
+    // extensions and other nested schema objects.
+    if (v && typeof v === 'object') {
+      out.push(...extractSchemaAnnotations(v, pathKey(path, k), depth + 1));
+    }
+  }
+  return out;
+}
+
 /** Strip long-form metadata from a JSON Schema node, preserving the structural
  *  keys a tool-use validator needs. Strips: description, title, examples,
  *  default, $schema, $id, $comment, long format. Recurses into
