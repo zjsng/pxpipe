@@ -145,17 +145,16 @@ describe('savings math — GPT, cross-checked against the real o200k tokenizer',
     }
   });
 
-  it('DECLINES A LOSER: refuses to image content where imaging would cost more than the real text', async () => {
-    // 2000-char slab: ~374 real tokens, but it would render to a ~1400-token image.
+  it('ACCEPTS A FORMER FALSE NEGATIVE: prices a short GPT page at its real height', async () => {
+    // The old gate charged this partial page as a full 1932px image and rejected
+    // it. Patch billing is based on the actual rendered dimensions, where it wins.
     const sys = slab(2_000);
     const realTok = o200k(sys);
     const { event, out } = await driveAndCapture('/v1/chat/completions', gptBody(2_000));
-    expect(event.info?.compressed).toBe(false);
-    expect(event.info?.gateEval?.profitable).toBe(false);
-    // The would-be image cost genuinely exceeds the real text cost → declining is correct.
-    expect(event.info!.gateEval!.imageTokens).toBeGreaterThan(realTok);
-    // And nothing was imaged: the forwarded body has no image parts.
-    expect(out).not.toContain('image_url');
+    expect(event.info?.compressed).toBe(true);
+    expect(event.info?.gateEval?.profitable).toBe(true);
+    expect(event.info!.gateEval!.imageTokens).toBeLessThan(realTok);
+    expect(out).toContain('image_url');
   });
 
   it('BELOW THRESHOLD: a tiny system is forwarded byte-for-byte (no gate, no image)', async () => {

@@ -11,6 +11,11 @@ describe('toTrackEvent', () => {
       status: 200,
       durationMs: 1234,
       firstByteMs: 200,
+      transformMs: 12,
+      queueMs: 34,
+      upstreamFirstByteMs: 154,
+      upstreamConcurrency: 3,
+      queueDepth: 2,
       info: {
         compressed: true,
         origChars: 16000,
@@ -48,6 +53,11 @@ describe('toTrackEvent', () => {
     expect(out.status).toBe(200);
     expect(out.duration_ms).toBe(1234);
     expect(out.first_byte_ms).toBe(200);
+    expect(out.transform_ms).toBe(12);
+    expect(out.queue_ms).toBe(34);
+    expect(out.upstream_first_byte_ms).toBe(154);
+    expect(out.upstream_concurrency).toBe(3);
+    expect(out.queue_depth).toBe(2);
     expect(out.compressed).toBe(true);
     expect(out.orig_chars).toBe(16000);
     expect(out.static_chars).toBe(14000);

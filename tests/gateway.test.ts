@@ -209,3 +209,23 @@ describe('provider-prefixed passthrough routing', () => {
     expect(cap.headers?.get('x-api-key')).toBeNull();
   });
 });
+
+describe('direct OpenAI model discovery routing', () => {
+  it.each(['/models', '/models/gpt-test'])('routes authenticated GET %s to openAIUpstream', async (pathname) => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+
+    await createProxy({
+      upstream: 'http://anthropic.test',
+      openAIUpstream: 'http://openai.test',
+    })(
+      new Request(`http://localhost${pathname}`, {
+        method: 'GET',
+        headers: { authorization: 'Bearer fake-openai-key' },
+      }),
+    );
+
+    expect(cap.url).toBe(`http://openai.test${pathname}`);
+    expect(cap.headers?.get('authorization')).toBe('Bearer fake-openai-key');
+  });
+});

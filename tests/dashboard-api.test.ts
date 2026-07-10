@@ -172,6 +172,8 @@ describe('serveFragment', () => {
     const off = await dash.serveFragment('toggle', url, 1234);
     const offHtml = await off.text();
     expect(offHtml).toContain('PASSTHROUGH MODE');
+    expect(offHtml).toContain('GPT and Claude requests still travel through pxpipe');
+    expect(offHtml).toContain("restore the client's original API base URL");
     expect(offHtml).toContain('Enable compression');
     dash.handleCompressionToggle({ enabled: true });
   });
@@ -216,6 +218,19 @@ describe('serveFragment', () => {
     expect(recent).toContain('gpt-5.5');
     const stats = await (await dash.serveFragment('stats', url, 4711)).text();
     expect(stats).toContain('requests');
+  });
+
+  it('reports every GPT 5.6 service tier in recent requests', async () => {
+    writeEvents(tmp, ['sol', 'terra', 'luna'].map((tier) => ev({
+      path: '/responses',
+      model: `gpt-5.6-${tier}`,
+      compressed: true,
+    })));
+    await dash.replay(tmp.eventsFile);
+    const recent = await (await dash.serveFragment('recent', url, 4711)).text();
+    expect(recent).toContain('gpt-5.6-sol');
+    expect(recent).toContain('gpt-5.6-terra');
+    expect(recent).toContain('gpt-5.6-luna');
   });
 
   it('escapes HTML in latest source text', async () => {

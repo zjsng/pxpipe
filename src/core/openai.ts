@@ -2,8 +2,8 @@
  * OpenAI Chat Completions + Responses API transformer for the GPT-5 family.
  * Separate from the Anthropic path: no cache-control breakpoints,
  * images as image_url/input_image parts, system/developer messages in messages[]/input[].
- * OpenAI tools keep native names/descriptions/schema shape; verbose schema prose
- * is also rendered into images for token savings so calls do not depend only on OCR.
+ * OpenAI tools keep native names/descriptions/schema shape; only schema annotations
+ * removed from that native shape are rendered, avoiding duplicate image patches.
  */
 
 import {
@@ -11,7 +11,11 @@ import {
   reflow,
   shrinkColsToContent,
   PAD_X,
+  PAD_Y,
   CELL_W,
+  CELL_H,
+  READABLE_CHARS_PER_IMAGE,
+  wrapLines,
   type RenderedImage,
 } from './render.js';
 import {
@@ -22,12 +26,11 @@ import {
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
-  estimateImageCount,
   sha8,
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
-import { stripSchemaDescriptions } from './schema-strip.js';
+import { extractSchemaAnnotations, stripSchemaDescriptions } from './schema-strip.js';
 import {
   planGptCollapse,
   responsesItemsToTurns,
@@ -93,7 +96,10 @@ function buildLiveRequestGuard(pinText?: string): string {
 export function openAIVisionTokens(model: string, w: number, h: number): number {
   const c = resolveVisionCost(model);
   if (c.regime === 'patch') {
-    const patches = Math.min(c.patchCap, Math.ceil(w / 32) * Math.ceil(h / 32));
+    const originalPatches = Math.ceil(w / 32) * Math.ceil(h / 32);
+    const patches = c.patchCap === undefined
+      ? originalPatches
+      : Math.min(c.patchCap, originalPatches);
     return Math.ceil(patches * c.multiplier);
   }
   let W = w, H = h;
@@ -318,27 +324,21 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
   );
 }
 
-/** Full doc (prose + compact schema JSON) for one tool. On this path the docs are
- *  IMAGED, so carrying the schema here is compression, not duplication: the imaged
- *  copy keeps param docs readable while tools[] ships the stripped skeleton.
- *  (Contrast transform.ts renderToolDoc: text reference → prose only.) */
-function renderToolDoc(tool: OpenAIFunctionTool): string {
-  const f = tool.function;
-  const parts = [`## Tool: ${f.name ?? '?'}`];
-  if (typeof f.description === 'string' && f.description.length > 0) parts.push(f.description);
-  if (f.parameters !== undefined) {
-    parts.push('```json\n' + JSON.stringify(f.parameters) + '\n```');
-  }
-  return parts.join('\n');
+function annotationValue(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
-function renderFlatToolDoc(tool: ResponsesFlatTool): string {
-  const parts = [`## Tool: ${tool.name ?? '?'}`];
-  if (typeof tool.description === 'string' && tool.description.length > 0) parts.push(tool.description);
-  if (tool.parameters !== undefined) {
-    parts.push('```json\n' + JSON.stringify(tool.parameters) + '\n```');
-  }
-  return parts.join('\n');
+/** Render only metadata removed from the native schema. Tool names, top-level
+ * descriptions, and the validation skeleton remain native, where GPT reads
+ * them losslessly; duplicating them in the image spends patches without
+ * replacing any text tokens. */
+function renderSchemaAnnotations(toolName: string, parameters: unknown): string {
+  const annotations = extractSchemaAnnotations(parameters);
+  if (annotations.length === 0) return '';
+  return [
+    `## Stripped schema annotations for tool: ${toolName}`,
+    ...annotations.map((a) => `${a.path}.${a.key}: ${annotationValue(a.value)}`),
+  ].join('\n');
 }
 
 function rewriteToolsForGpt(tools: unknown[] | undefined): {
@@ -350,8 +350,9 @@ function rewriteToolsForGpt(tools: unknown[] | undefined): {
   let changed = false;
   const rewritten = tools.map((tool) => {
     if (!isFunctionTool(tool)) return tool;
-    docs.push(renderToolDoc(tool));
     if (tool.function.parameters === undefined) return tool;
+    const doc = renderSchemaAnnotations(tool.function.name ?? '?', tool.function.parameters);
+    if (doc) docs.push(doc);
     changed = true;
     return {
       ...tool,
@@ -373,8 +374,9 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
   let changed = false;
   const rewritten = tools.map((tool) => {
     if (!isFlatFunctionTool(tool)) return tool;
-    docs.push(renderFlatToolDoc(tool));
     if (tool.parameters === undefined) return tool;
+    const doc = renderSchemaAnnotations(tool.name ?? '?', tool.parameters);
+    if (doc) docs.push(doc);
     changed = true;
     return {
       ...tool,
@@ -389,7 +391,7 @@ function openAIImagePart(img: RenderedImage): OpenAIImagePart {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      detail: 'original', // gpt-5.x: 'original' = 10k-patch/6000px budget; 'high' (2.5k/2048px) downscales dense text
+      detail: 'original', // GPT-5.6 preserves original pixels; low/high may resize dense 5x8 text
     },
   };
 }
@@ -463,18 +465,49 @@ function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<st
   return out;
 }
 
-/** Shared gate: compute image vs text token cost and decide profitability. */
+/** GPT page-cost estimator that mirrors renderTextToPngs' real layout. The old
+ * gate reused Anthropic's 728px page count, then charged every estimated page
+ * as a full 1932px GPT image. Reflow's inline ↵ glyphs were also counted as
+ * row breaks. Together that rejected profitable history by 10× or more. */
+function estimateOpenAIImageTokens(model: string, text: string, cols: number): number {
+  const lines = wrapLines(text, cols);
+  const maxHeightPx = resolveGptProfile(model).maxHeightPx;
+  const hardLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / CELL_H));
+  const readableLines = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+  const linesPerPage = Math.min(hardLines, readableLines);
+  const width = 2 * PAD_X + cols * CELL_W;
+
+  let total = 0;
+  let pageLines = 0;
+  let pageChars = 0;
+  const flush = (): void => {
+    if (pageLines === 0) return;
+    const height = 2 * PAD_Y + pageLines * CELL_H;
+    total += openAIVisionTokens(model, width, height);
+    pageLines = 0;
+    pageChars = 0;
+  };
+  for (const line of lines) {
+    const lineChars = line.length + (pageLines > 0 ? 1 : 0);
+    if (pageLines > 0 && (pageLines >= linesPerPage || pageChars + lineChars > READABLE_CHARS_PER_IMAGE)) {
+      flush();
+    }
+    pageLines++;
+    pageChars += line.length + (pageLines > 1 ? 1 : 0);
+  }
+  flush();
+  return total;
+}
+
+/** Shared gate: exact o200k text value vs actual GPT page geometry. */
 function evalOpenAIGate(
   model: string,
   renderedText: string,
   cols: number,
-  charsPerToken: number,
+  baselineTextTokens?: number,
 ): { imageTokens: number; textTokens: number; profitable: boolean } {
-  const stripW = 2 * PAD_X + cols * CELL_W;
-  const estImages = estimateImageCount(renderedText, cols, 1);
-  const perStrip = openAIVisionTokens(model, stripW, resolveGptProfile(model).maxHeightPx);
-  const imageTokens = estImages * perStrip;
-  const textTokens = renderedText.length / charsPerToken;
+  const imageTokens = estimateOpenAIImageTokens(model, renderedText, cols);
+  const textTokens = baselineTextTokens ?? gptTextTokens(renderedText);
   return { imageTokens, textTokens, profitable: imageTokens < textTokens };
 }
 
@@ -577,12 +610,12 @@ function foldGptHistory(
 
 const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and full tool/schema documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions; the image is supplemental documentation.' +
+  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and schema annotations rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, names, descriptions, and schema structure remain in native JSON; the image supplements stripped annotations.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain instructions and full tool/schema documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions; the image is supplemental documentation.' +
+  'These images were injected by pxpipe, not by the end user. They contain instructions and schema annotations rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, names, descriptions, and schema structure remain in native JSON; the image supplements stripped annotations.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const CHAT_POINTER =
@@ -659,8 +692,9 @@ export async function transformOpenAIChatCompletions(
   const header = CHAT_HEADER.replace('\n====', reflowNote + '\n====');
   const renderedText = header + combined;
   const cols = Math.min(shrinkColsToContent(renderedText, o.cols), resolveGptProfile(req.model).stripCols);
+  const baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  const gate = evalOpenAIGate(req.model, renderedText, cols, baselineImagedTokens);
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
@@ -691,7 +725,7 @@ export async function transformOpenAIChatCompletions(
   // the same content would have cost unproxied. req.tools is still the original
   // (reassigned to the stripped set below). See src/core/openai-savings.ts.
   info.imageTokens = gptImageTokens(req.model, images);
-  info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
+  info.baselineImagedTokens = baselineImagedTokens;
   info.compressedChars = combinedRaw.length;
   info.bucketChars = { static_slab: combinedRaw.length };
   info.systemSha8 = await sha8(combined);
@@ -729,14 +763,16 @@ export async function transformOpenAIChatCompletions(
   // item carries static images and is protected; the original opening user prompt
   // remains collapsible history instead of looking like the live request.
   if (o.collapseHistory) {
+    const profile = resolveGptProfile(req.model);
     const turns = chatMessagesToTurns(req.messages);
-    const profitable = (text: string, cols: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+    const profitable = (text: string, cols: number, baselineTextTokens: number) =>
+      evalOpenAIGate(req.model, text, cols, baselineTextTokens).profitable;
     const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, {
       ...o.gptHistory,
       reflow: o.reflow,
-      cols: o.gptHistory?.cols ?? resolveGptProfile(req.model).stripCols,
-      maxHeightPx: o.gptHistory?.maxHeightPx ?? resolveGptProfile(req.model).maxHeightPx,
+      cols: o.gptHistory?.cols ?? profile.stripCols,
+      maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
+      sectionTokens: o.gptHistory?.sectionTokens ?? profile.historySectionTokens,
     });
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];
@@ -866,8 +902,9 @@ export async function transformOpenAIResponses(
   const header = RESPONSES_HEADER.replace('\n====', reflowNote + '\n====');
   const renderedText = header + combined;
   const cols = Math.min(shrinkColsToContent(renderedText, o.cols), resolveGptProfile(req.model).stripCols);
+  const baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  const gate = evalOpenAIGate(req.model, renderedText, cols, baselineImagedTokens);
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
@@ -896,7 +933,7 @@ export async function transformOpenAIResponses(
   // GPT savings basis (see src/core/openai-savings.ts). req.tools is still the
   // original here — reassigned to the stripped set below.
   info.imageTokens = gptImageTokens(req.model, images);
-  info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
+  info.baselineImagedTokens = baselineImagedTokens;
   info.compressedChars = combinedRaw.length;
   info.bucketChars = { static_slab: combinedRaw.length };
   info.systemSha8 = await sha8(combined);
@@ -967,14 +1004,16 @@ export async function transformOpenAIResponses(
   // item is protected; the transcript OpenCode resends every turn is the real cost.
   // Skip for bare-string input (single message, nothing to collapse).
   if (o.collapseHistory && !inputWasString) {
+    const profile = resolveGptProfile(req.model);
     const turns = responsesItemsToTurns(inputItems);
-    const profitable = (text: string, cols: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+    const profitable = (text: string, cols: number, baselineTextTokens: number) =>
+      evalOpenAIGate(req.model, text, cols, baselineTextTokens).profitable;
     const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, {
       ...o.gptHistory,
       reflow: o.reflow,
-      cols: o.gptHistory?.cols ?? resolveGptProfile(req.model).stripCols,
-      maxHeightPx: o.gptHistory?.maxHeightPx ?? resolveGptProfile(req.model).maxHeightPx,
+      cols: o.gptHistory?.cols ?? profile.stripCols,
+      maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
+      sectionTokens: o.gptHistory?.sectionTokens ?? profile.historySectionTokens,
     });
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];

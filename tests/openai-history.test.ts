@@ -79,10 +79,18 @@ describe('chatMessagesToTurns', () => {
 
 describe('planGptCollapse — gates', () => {
   it('refuses when the collapsible prefix is shorter than minCollapsePrefix', async () => {
-    const turns = plainTurns(8); // keepTail 6 + need 10 prefix → too short
-    const plan = await planGptCollapse(turns, 0, yes);
+    const turns = plainTurns(8);
+    const plan = await planGptCollapse(turns, 0, yes, { minCollapsePrefix: 3 });
     expect(plan.images).toHaveLength(0);
     expect(plan.reason).toBe('prefix_too_short');
+  });
+
+  it('allows one large old item through the token and profitability gates', async () => {
+    const turns = plainTurns(7, 20_000); // one imageable item + six live-tail items
+    const plan = await planGptCollapse(turns, 0, yes, { sectionTokens: 1000 });
+    expect(plan.reason).toBeUndefined();
+    expect(plan.collapsedTurns).toBe(1);
+    expect(plan.images.length + plan.imagesAfter.length).toBeGreaterThan(0);
   });
 
   it('refuses when collapsed text is below minCollapseTokens', async () => {
