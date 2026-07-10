@@ -38,7 +38,7 @@ export interface ProxyConfig {
 export interface ProxyEvent {
   method: string;
   path: string;
-  /** Top-level request model when present. Used for telemetry/dashboard labels only. */
+  /** Upstream-resolved model when reported, otherwise the top-level request model. */
   model?: string;
   status: number;
   /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
@@ -118,7 +118,7 @@ export interface OutputMeasurement {
 function processSseEvent(
   block: string,
   m: OutputMeasurement,
-  state: { usage: Usage | undefined; stopReason: string | undefined },
+  state: { usage: Usage | undefined; stopReason: string | undefined; model: string | undefined },
 ): void {
   // Parse `event:` + `data:` lines; continuation data: lines concatenate per SSE spec.
   let event = '';
@@ -135,6 +135,16 @@ function processSseEvent(
     return;
   }
   const obj = j as Record<string, unknown>;
+
+  // Prefer the model resolved by the upstream response over the requested
+  // alias. Codex can route the GPT 5.6 class to Sol, Terra, or Luna and reports
+  // that tier on the response object. Keeping only the request model made
+  // non-Sol traffic indistinguishable in dashboard telemetry.
+  const response = obj.response as { model?: unknown } | undefined;
+  const reportedModel = response?.model ?? obj.model;
+  if (typeof reportedModel === 'string' && reportedModel.length > 0) {
+    state.model = reportedModel;
+  }
 
   // The public Responses API normally sends an explicit SSE `event:` line,
   // but the subscription-backed Codex endpoint sends data-only SSE blocks and
@@ -326,6 +336,7 @@ function teeForUsage(res: Response): {
   errorBodyPromise: Promise<string | undefined>;
   measurementPromise: Promise<OutputMeasurement | undefined>;
   stopReasonPromise: Promise<string | undefined>;
+  modelPromise: Promise<string | undefined>;
 } {
   // No body at all: nothing to extract on either path.
   if (!res.body) {
@@ -335,6 +346,7 @@ function teeForUsage(res: Response): {
       errorBodyPromise: Promise.resolve(undefined),
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
+      modelPromise: Promise.resolve(undefined),
     };
   }
   // 4xx: tee for the error body but skip usage scanning entirely.
@@ -371,6 +383,7 @@ function teeForUsage(res: Response): {
       errorBodyPromise,
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
+      modelPromise: Promise.resolve(undefined),
     };
   }
   // 5xx: skip both (the host already synthesizes an error message).
@@ -381,6 +394,7 @@ function teeForUsage(res: Response): {
       errorBodyPromise: Promise.resolve(undefined),
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
+      modelPromise: Promise.resolve(undefined),
     };
   }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -391,6 +405,7 @@ function teeForUsage(res: Response): {
     usage: Usage | undefined;
     measurement: OutputMeasurement | undefined;
     stopReason: string | undefined;
+    model: string | undefined;
   }> => {
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
@@ -410,9 +425,10 @@ function teeForUsage(res: Response): {
           toolUseChars: 0,
           redactedBlockCount: 0,
         };
-        const state: { usage: Usage | undefined; stopReason: string | undefined } = {
+        const state: { usage: Usage | undefined; stopReason: string | undefined; model: string | undefined } = {
           usage: undefined,
           stopReason: undefined,
+          model: undefined,
         };
         while (true) {
           const { done, value } = await reader.read();
@@ -430,7 +446,7 @@ function teeForUsage(res: Response): {
         }
         buf += decoder.decode();
         if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
-        return { usage: state.usage, measurement: m, stopReason: state.stopReason };
+        return { usage: state.usage, measurement: m, stopReason: state.stopReason, model: state.model };
       }
 
       if (ct.includes('application/json')) {
@@ -447,9 +463,10 @@ function teeForUsage(res: Response): {
             usage: normalizeUsage(j?.usage),
             measurement: measureFromMessageJson(j),
             stopReason: readStopReasonFromJson(j),
+            model: typeof j?.model === 'string' ? j.model : undefined,
           };
         } catch {
-          return { usage: undefined, measurement: undefined, stopReason: undefined };
+          return { usage: undefined, measurement: undefined, stopReason: undefined, model: undefined };
         }
       }
     } catch {
@@ -464,7 +481,7 @@ function teeForUsage(res: Response): {
     } catch {
       /* ignore */
     }
-    return { usage: undefined, measurement: undefined, stopReason: undefined };
+    return { usage: undefined, measurement: undefined, stopReason: undefined, model: undefined };
   })();
 
   return {
@@ -477,6 +494,7 @@ function teeForUsage(res: Response): {
     errorBodyPromise: Promise.resolve(undefined),
     measurementPromise: scanResult.then((s) => s.measurement),
     stopReasonPromise: scanResult.then((s) => s.stopReason),
+    modelPromise: scanResult.then((s) => s.model),
   };
 }
 
@@ -642,6 +660,7 @@ export function createProxy(config: ProxyConfig = {}) {
       errorBody?: string,
       measurement?: OutputMeasurement,
       stopReason?: string,
+      resolvedModel?: string,
     ): void => {
       const is4xx = status >= 400 && status < 500;
       // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
@@ -690,7 +709,7 @@ export function createProxy(config: ProxyConfig = {}) {
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
-          model: requestModel,
+          model: resolvedModel ?? requestModel,
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
@@ -831,17 +850,18 @@ export function createProxy(config: ProxyConfig = {}) {
     const firstByteMs = Date.now() - t0;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
+    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise, modelPromise } =
       teeForUsage(upstreamRes);
 
-    // Fire event in background once all four resolve (all share the same stream read).
+    // Fire event in background once all scanner fields resolve (they share one stream read).
     void Promise.all([
       usagePromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason),
+      modelPromise.catch(() => undefined),
+    ]).then(([usage, errorBody, measurement, stopReason, resolvedModel]) =>
+      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason, resolvedModel),
     );
 
     return new Response(teed.body, {

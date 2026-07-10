@@ -96,6 +96,9 @@ describe('public library API', () => {
     expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-luna')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.6[1m]')).toBe(true);
