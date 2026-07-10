@@ -216,6 +216,7 @@ describe('proxy usage extraction', () => {
         JSON.stringify({
           id: 'chatcmpl_1',
           object: 'chat.completion',
+          model: 'gpt-5.6-luna',
           choices: [{ message: { role: 'assistant', content: 'hello' } }],
           usage: { prompt_tokens: 55, completion_tokens: 7, total_tokens: 62 },
         }),
@@ -273,6 +274,7 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.usage?.input_tokens).toBe(55);
     expect(captured!.usage?.output_tokens).toBe(7);
+    expect(captured!.model).toBe('gpt-5.6-luna');
     expect(captured!.info?.baselineProbeStatus).toBeUndefined();
   });
 
@@ -491,6 +493,7 @@ describe('proxy usage extraction', () => {
       'data: ' + JSON.stringify({
         type: 'response.completed',
         response: {
+          model: 'gpt-5.6-terra',
           status: 'completed',
           usage: {
             input_tokens: 321,
@@ -536,6 +539,7 @@ describe('proxy usage extraction', () => {
     expect(captured!.usage?.input_tokens).toBe(321);
     expect(captured!.usage?.cached_tokens).toBe(200);
     expect(captured!.usage?.output_tokens).toBe(17);
+    expect(captured!.model).toBe('gpt-5.6-terra');
     expect(captured!.stopReason).toBe('stop');
   });
 
