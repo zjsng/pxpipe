@@ -94,6 +94,14 @@ export interface TrackEvent {
   cache_prefix_sha8?: string;
   /** Approx chars in that pinned prefix (growth vs pure-invalidation split). */
   cache_prefix_bytes?: number;
+  /** GPT-5.6 request used pxpipe's explicit static-slab cache breakpoint. */
+  gpt_prompt_cache_explicit?: boolean;
+  /** GPT-5.6 stateful Responses request opted into reasoning.context=all_turns. */
+  gpt_persisted_reasoning?: boolean;
+  /** Opaque reasoning items forwarded after pxpipe history transformation. */
+  gpt_reasoning_items?: number;
+  /** Forwarded reasoning items containing encrypted_content. */
+  gpt_encrypted_reasoning_items?: number;
 
   // From TransformInfo.env:
   cwd?: string;
@@ -291,6 +299,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.cachePrefixSha8) out.cache_prefix_sha8 = info.cachePrefixSha8;
     if (info.cachePrefixBytes !== undefined) out.cache_prefix_bytes = info.cachePrefixBytes;
+    if (info.gptPromptCacheExplicit) out.gpt_prompt_cache_explicit = true;
+    if (info.gptPersistedReasoning) out.gpt_persisted_reasoning = true;
+    if (info.gptReasoningItems !== undefined) out.gpt_reasoning_items = info.gptReasoningItems;
+    if (info.gptEncryptedReasoningItems !== undefined) {
+      out.gpt_encrypted_reasoning_items = info.gptEncryptedReasoningItems;
+    }
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
     if (info.churningStaticTags && info.churningStaticTags.length > 0)

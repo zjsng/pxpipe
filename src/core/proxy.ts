@@ -4,7 +4,12 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
+import {
+  applyGpt56RequestOptimizations,
+  isClaudeModel,
+  transformOpenAIChatCompletions,
+  transformOpenAIResponses,
+} from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
@@ -636,6 +641,14 @@ export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
+  // The ChatGPT subscription Codex transport is Responses-shaped but does not
+  // accept the public API's GPT-5.6 prompt_cache_options/breakpoint fields.
+  // Codex already supplies its own prompt_cache_key, reasoning.context, and
+  // encrypted reasoning replay. Keep those caller fields, but do not inject the
+  // public-only explicit-cache controls (confirmed by live codex exec: HTTP 400).
+  const explicitPromptCachingSupported = !/chatgpt\.com\/backend-api\/codex(?:\/|$)/i.test(
+    openAIUpstream,
+  );
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
     ? (config.gatewayBaseUrl ?? '').replace(/\/+$/, '')
     : upstream;
@@ -781,11 +794,20 @@ export function createProxy(config: ProxyConfig = {}) {
             ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
             : await transformOpenAIResponses(bodyIn, effectiveOpts);
         if (!modelOk) r.info.reason = 'unsupported_model';
-        bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
+        const optimizedBody = isOpenAIChat
+          ? applyGpt56RequestOptimizations(
+              r.body, 'chat', effectiveOpts, r.info, explicitPromptCachingSupported,
+            )
+          : isOpenAIResponses
+            ? applyGpt56RequestOptimizations(
+                r.body, 'responses', effectiveOpts, r.info, explicitPromptCachingSupported,
+              )
+            : r.body;
+        bodyOut = optimizedBody as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
-        reqBodyBytes = r.body;
-        if (r.body.byteLength > 0) {
-          reqBodySha8 = await sha8Bytes(r.body);
+        reqBodyBytes = optimizedBody;
+        if (optimizedBody.byteLength > 0) {
+          reqBodySha8 = await sha8Bytes(optimizedBody);
         }
 
         if (isMessages && messagesAnthropic) {

@@ -109,6 +109,13 @@ export interface TransformOptions {
   collapseHistory?: boolean;
   /** GPT only: history-collapse tuning overrides (keepTail / collapseChunk / …). */
   gptHistory?: Partial<GptHistoryOptions>;
+  /** GPT-5.6 only: put pxpipe's deterministic static slab behind an explicit
+   * prompt-cache breakpoint. Default on. Caller-supplied cache fields win. */
+  gpt56PromptCaching?: boolean;
+  /** GPT-5.6 Responses only: request reasoning.context=all_turns when the caller
+   * already supplies previous_response_id or conversation state. Default off;
+   * enable only for workflows whose goals/assumptions stay stable across turns. */
+  gpt56PersistedReasoning?: boolean;
   /** Re-pack image-bound text into a ↵-delimited stream to fill `cols` (~29%→75-80%
    *  glyph-fill). ON by default (98.95% char accuracy at L1 OCR eval, +1pp vs baseline).
    *  Hard newlines become visible ↵ glyphs — tell the model via system prompt. */
@@ -150,6 +157,8 @@ const DEFAULTS: Required<TransformOptions> = {
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
+  gpt56PromptCaching: true,
+  gpt56PersistedReasoning: false,
 };
 
 // --- per-block break-even check ---
@@ -557,6 +566,14 @@ export interface TransformInfo {
   env?: EnvFields;
   /** sha8 of static slab + tool docs (what goes in the image). Repeats across turns → cache hits. */
   systemSha8?: string;
+  /** GPT-5.6 explicit prompt caching was attached to pxpipe's static slab. */
+  gptPromptCacheExplicit?: boolean;
+  /** GPT-5.6 persisted reasoning was enabled on an existing stateful Responses chain. */
+  gptPersistedReasoning?: boolean;
+  /** Opaque reasoning items present in the final outgoing Responses input. */
+  gptReasoningItems?: number;
+  /** Outgoing reasoning items carrying encrypted_content for stateless replay. */
+  gptEncryptedReasoningItems?: number;
   /** sha8 of the CLAUDE.md section, for bucketing by project when cwd is absent. */
   claudeMdSha8?: string;
   /** sha8 of first user message text (first 4 KiB). Rough thread/session id. */

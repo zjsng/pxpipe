@@ -24,6 +24,8 @@ export interface Env {
   OPENAI_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever Authorization the client sent. */
   OPENAI_API_KEY?: string;
+  PXPIPE_GPT56_PROMPT_CACHE?: string;
+  PXPIPE_GPT56_REASONING_CONTEXT?: string;
   COMPRESS?: string;
   COMPRESS_TOOLS?: string;
   COMPRESS_REMINDERS?: string;
@@ -114,6 +116,9 @@ export default {
       // R2 multi-column ON (2 cols) — single-col drops below break-even on
       // real tool-doc slabs. Override via MULTI_COL=1 if OCR misreads layout.
       multiCol: env.MULTI_COL ? Math.max(1, Number(env.MULTI_COL) | 0) : 2,
+      gpt56PromptCaching: truthy(env.PXPIPE_GPT56_PROMPT_CACHE, true),
+      gpt56PersistedReasoning:
+        env.PXPIPE_GPT56_REASONING_CONTEXT?.trim().toLowerCase() === 'all_turns',
     };
     const trackingOn = truthy(env.PXPIPE_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line

@@ -49,6 +49,8 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   openAIConcurrency: number;
+  gpt56PromptCaching: boolean;
+  gpt56PersistedReasoning: boolean;
   eventsFile: string;
 }
 
@@ -116,6 +118,9 @@ function parseCli(argv: string[]): RuntimeConfig {
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
     openAIConcurrency: parseNonNegativeInt(process.env.PXPIPE_OPENAI_CONCURRENCY, 3),
+    gpt56PromptCaching: parseBoolean(process.env.PXPIPE_GPT56_PROMPT_CACHE, true),
+    gpt56PersistedReasoning:
+      process.env.PXPIPE_GPT56_REASONING_CONTEXT?.trim().toLowerCase() === 'all_turns',
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
@@ -126,6 +131,11 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
   if (value === undefined || value.trim() === '') return fallback;
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(value.trim());
 }
 
 function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
@@ -166,6 +176,11 @@ Environment:
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   PXPIPE_OPENAI_CONCURRENCY
                           max concurrent OpenAI generations (default 3; 0 disables)
+  PXPIPE_GPT56_PROMPT_CACHE
+                          explicit-cache pxpipe's stable GPT-5.6 slab (default true)
+  PXPIPE_GPT56_REASONING_CONTEXT
+                          all_turns enables persisted reasoning for existing
+                          previous_response_id/conversation chains (default off)
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
@@ -957,7 +972,10 @@ async function main(): Promise<void> {
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
       // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
+      return {
+        gpt56PromptCaching: opts.gpt56PromptCaching,
+        gpt56PersistedReasoning: opts.gpt56PersistedReasoning,
+      };
     },
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips

@@ -210,6 +210,88 @@ interface ResponsesRequest {
   [k: string]: unknown;
 }
 
+type Gpt56RequestKind = 'chat' | 'responses';
+const STATIC_SLAB_END = '[End of rendered GPT system/tool context.]';
+
+function isGpt56(model: unknown): model is string {
+  return typeof model === 'string' && /^gpt-5\.6(?:-|$)/i.test(model);
+}
+
+function isReasoningItem(item: unknown): item is Record<string, unknown> {
+  return !!item && typeof item === 'object' && (item as { type?: unknown }).type === 'reasoning';
+}
+
+function addExplicitBreakpoint(req: Record<string, unknown>, kind: Gpt56RequestKind): boolean {
+  const items = kind === 'chat' ? req.messages : req.input;
+  if (!Array.isArray(items)) return false;
+  for (const item of items) {
+    const content = (item as { content?: unknown } | undefined)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue;
+      const p = part as Record<string, unknown>;
+      if (p.text !== STATIC_SLAB_END) continue;
+      if (p.prompt_cache_breakpoint === undefined) p.prompt_cache_breakpoint = { mode: 'explicit' };
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Apply opt-in GPT-5.6 cache and persisted-reasoning features after compression. */
+export function applyGpt56RequestOptimizations(
+  body: Uint8Array,
+  kind: Gpt56RequestKind,
+  opts: TransformOptions | undefined,
+  info: TransformInfo,
+  explicitPromptCachingSupported = true,
+): Uint8Array {
+  if (opts?.compress === false) return body;
+  let req: Record<string, unknown>;
+  try { req = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>; }
+  catch { return body; }
+  if (!isGpt56(req.model)) return body;
+
+  let changed = false;
+  if (explicitPromptCachingSupported && (opts?.gpt56PromptCaching ?? true) && info.compressed && info.systemSha8) {
+    if (addExplicitBreakpoint(req, kind)) {
+      if (req.prompt_cache_key === undefined) req.prompt_cache_key = `pxpipe:gpt56:${info.systemSha8}`;
+      if (req.prompt_cache_options === undefined) req.prompt_cache_options = { mode: 'explicit' };
+      else if (req.prompt_cache_options && typeof req.prompt_cache_options === 'object' && !Array.isArray(req.prompt_cache_options)) {
+        const options = req.prompt_cache_options as Record<string, unknown>;
+        if (options.mode === undefined) options.mode = 'explicit';
+      }
+      info.gptPromptCacheExplicit = true;
+      changed = true;
+    }
+  }
+
+  const hasServerState = req.previous_response_id != null || req.conversation != null;
+  if (kind === 'responses' && opts?.gpt56PersistedReasoning === true && hasServerState) {
+    if (req.reasoning === undefined) {
+      req.reasoning = { context: 'all_turns' };
+      info.gptPersistedReasoning = true;
+      changed = true;
+    } else if (req.reasoning && typeof req.reasoning === 'object' && !Array.isArray(req.reasoning)) {
+      const reasoning = req.reasoning as Record<string, unknown>;
+      if (reasoning.context === undefined) {
+        reasoning.context = 'all_turns';
+        info.gptPersistedReasoning = true;
+        changed = true;
+      }
+    }
+  }
+
+  if (kind === 'responses' && Array.isArray(req.input)) {
+    const reasoningItems = req.input.filter(isReasoningItem);
+    info.gptReasoningItems = reasoningItems.length;
+    info.gptEncryptedReasoningItems = reasoningItems.filter(
+      (item) => typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0,
+    ).length;
+  }
+  return changed ? new TextEncoder().encode(JSON.stringify(req)) : body;
+}
+
 interface ResponsesFlatTool {
   type: 'function';
   name?: string;
@@ -915,7 +997,7 @@ export async function transformOpenAIChatCompletions(
     content: [
       ...imageParts,
       ...(slabFactSheet ? [{ type: 'text', text: slabFactSheet } as OpenAIContentPart] : []),
-      { type: 'text', text: '[End of rendered GPT system/tool context.]' },
+      { type: 'text', text: STATIC_SLAB_END },
     ],
   };
   req.messages = [
@@ -1125,7 +1207,7 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: STATIC_SLAB_END };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
   const slabFactSheet = factSheetText(combinedRaw);
   const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet

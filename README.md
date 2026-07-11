@@ -123,6 +123,19 @@ are imaged.
   state tracking. Enable with
   `PXPIPE_MODELS=claude-fable-5,grok-4.5` or the dashboard chip.
   [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
+- **GPT-5.6 cache writes:** pxpipe marks its deterministic rendered static slab
+  as an explicit OpenAI prompt-cache breakpoint and supplies a stable cache key.
+  This avoids the default implicit breakpoint writing the changing latest turn
+  at 1.25× input price. Set `PXPIPE_GPT56_PROMPT_CACHE=false` to disable it.
+  The ChatGPT subscription Codex backend rejects these public-API fields, so
+  pxpipe detects that upstream and preserves Codex's native caching unchanged.
+- **Persisted reasoning (opt-in):** set
+  `PXPIPE_GPT56_REASONING_CONTEXT=all_turns` to add
+  `reasoning.context: "all_turns"` only when a Responses request already uses
+  `previous_response_id` or `conversation`. pxpipe does not invent server state
+  or rewrite stateless history, and preserves any caller-supplied context mode.
+  Current Codex CLI builds already send `all_turns` plus encrypted reasoning
+  replay; pxpipe preserves those fields without modification.
 
 ## Benchmarks (reproducible)
 
