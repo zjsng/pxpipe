@@ -29,15 +29,7 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
-import {
-  computeActualInputEff,
-  computeBaselineInputEff,
-  deriveBaselineWarmth,
-} from './core/baseline.js';
-import {
-  computeOpenAIActualInputEff,
-  computeOpenAIBaselineInputEff,
-} from './core/openai-savings.js';
+import { accountUsage, isSafetyStopReason } from './core/accounting.js';
 import { providerForPath, serviceTierFor, type ProviderId } from './core/provider.js';
 
 // ---- Types -----------------------------------------------------------------
@@ -75,11 +67,41 @@ export interface SessionSummary {
   providers: ProviderId[];
   models: string[];
   serviceTiers: string[];
+  /** Provider-separated session accounting. Values named `...Weighted` are
+   * provider input-credit equivalents; they are not cross-provider USD. */
+  providerStats: Record<string, SessionProviderSummary>;
   /** Bytes attributable to this session in events.jsonl (sum of line lengths
    *  including the trailing newline). */
   jsonlBytes: number;
   /** Bytes attributable to this session in 4xx-bodies/ sidecars. */
   sidecarBytes: number;
+}
+
+export interface SessionProviderSummary {
+  provider: ProviderId;
+  requests: number;
+  compressedRequests: number;
+  usageRequests: number;
+  inputTokens: number;
+  ordinaryInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  baselineMeasuredCount: number;
+  /** Measured compressed rows only; same basis as savedInputWeighted. */
+  baselineInputWeighted: number;
+  /** Measured compressed rows only; same basis as baselineInputWeighted. */
+  actualInputWeighted: number;
+  /** All successful usage-bearing rows, including passthrough/unmeasured rows. */
+  allBaselineEquivalentWeighted: number;
+  allActualInputWeighted: number;
+  allOutputWeighted: number;
+  savedInputWeighted: number;
+  models: string[];
+  serviceTiers: string[];
 }
 
 export interface DiskUsage {
@@ -138,10 +160,6 @@ function sessionIdOf(ev: TrackEvent): string {
   return ev.first_user_sha8 ?? UNKNOWN_SESSION;
 }
 
-function isOpenAIEvent(ev: TrackEvent): boolean {
-  return providerForPath(ev.path, ev.model) === 'openai';
-}
-
 export interface AggregateResult {
   sessions: Map<string, SessionSummary>;
   /** sessionId -> set of absolute sidecar paths referenced by its events. */
@@ -155,12 +173,9 @@ export async function aggregateSessions(
 ): Promise<AggregateResult> {
   const sessions = new Map<string, SessionSummary>();
   const sidecarsBySession = new Map<string, Set<string>>();
-  // Per-session prior prefix sizes for the cache-aware text counterfactual.
-  // Warm/cold comes only from server-observed cache_read; this map only refines
-  // reused/grown splitting after cr>0 has proved warmth. Kept out of
-  // SessionSummary so it never leaks into the /api/sessions.json shape.
+  // The same accounting state/function is used by DashboardState and stats so
+  // session charts cannot quietly price passthrough or refusal rows as wins.
   const warmth = new Map<string, { ts: number; cacheable: number; prefixSha?: string }>();
-  const CACHE_TTL_SEC = 300;
 
   // Stat sidecar sizes once up front. Looking up size per event would be
   // O(N²) syscalls; the directory is small enough to read fully.
@@ -187,6 +202,7 @@ export async function aggregateSessions(
         providers: [],
         models: [],
         serviceTiers: [],
+        providerStats: {},
         jsonlBytes: 0,
         sidecarBytes: 0,
       };
@@ -204,98 +220,102 @@ export async function aggregateSessions(
     if (ev.model && !s.models.includes(ev.model)) s.models.push(ev.model);
     const tier = serviceTierFor(ev.model, ev.service_tier);
     if (tier && !s.serviceTiers.includes(tier)) s.serviceTiers.push(tier);
-    // Real per-session savings, cache-aware. See src/core/baseline.ts for the
-    // full derivation: pxpipe is credited only for token reduction, never for
-    // caching. The imagined text baseline gets the SAME observed cache state as
-    // the actual request: cr>0 means warm for both, cr===0 means cold for both.
-    // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
-    const haveUsage = inp > 0 || cc > 0 || cr > 0
-      || (ev.cached_tokens ?? 0) > 0
-      || (ev.cache_write_tokens ?? 0) > 0
-      || (ev.output_tokens ?? 0) > 0
-      || (ev.reasoning_tokens ?? 0) > 0;
-    const baseline = ev.baseline_tokens;
-    const gpt = isOpenAIEvent(ev);
-    if (gpt && haveUsage) {
-      const image = ev.image_tokens ?? 0;
-      const baselineImaged = ev.baseline_imaged_tokens ?? 0;
-      if (image > 0 && baselineImaged > 0 && ev.compressed === true && !ev.safety_flagged) {
-        const actualEff = computeOpenAIActualInputEff(
-          inp,
-          ev.cached_tokens ?? 0,
-          ev.model,
-          ev.cache_write_tokens ?? 0,
-        );
-        const baselineEff = computeOpenAIBaselineInputEff(
-          inp,
-          ev.cached_tokens ?? 0,
-          image,
-          baselineImaged,
-          ev.model,
-          ev.cache_write_tokens ?? 0,
-        );
-        const tokensSaved = baselineEff - actualEff;
-        s.tokensSavedEst += Math.round(tokensSaved);
-        s.charsSaved += Math.round(tokensSaved * 4);
-      }
+    const gpt = provider === 'openai';
+    const completionSec = Date.parse(ev.ts) / 1000;
+    const acc = accountUsage(
+      {
+        provider,
+        model: ev.model,
+        status: ev.status,
+        compressed: ev.compressed === true,
+        safetyFlagged: ev.safety_flagged === true || isSafetyStopReason(ev.stop_reason),
+        inputTokens: inp,
+        outputTokens: ev.output_tokens,
+        reasoningTokens: ev.reasoning_tokens,
+        cacheCreateTokens: cc,
+        cacheReadTokens: cr,
+        cachedTokens: ev.cached_tokens,
+        cacheWriteTokens: ev.cache_write_tokens,
+        imageTokens: ev.image_tokens,
+        baselineImagedTokens: ev.baseline_imaged_tokens,
+        baselineTokens: ev.baseline_tokens,
+        baselineCacheableTokens: ev.baseline_cacheable_tokens,
+        baselineProbeStatus: ev.baseline_probe_status,
+        sessionId: id,
+        completionSec,
+        requestStartSec: completionSec - Math.max(0, ev.duration_ms || 0) / 1000,
+        prefixSha: ev.system_sha8,
+      },
+      { warmth },
+    );
+    if (acc.creditSaving) {
+      const tokensSaved = acc.baselineInputEff - acc.actualInputEff;
+      // Keep the same fractional provider-credit basis as the live dashboard;
+      // round once per session at the end rather than once per request.
+      s.tokensSavedEst += tokensSaved;
+      s.charsSaved += tokensSaved * 4;
     }
-    if (
-      !gpt &&
-      typeof baseline === 'number' &&
-      baseline > 0 &&
-      haveUsage
-    ) {
-      const cacheable = ev.baseline_cacheable_tokens ?? 0;
-      const prefixSha = ev.system_sha8;
-      const completionSec = Date.parse(ev.ts) / 1000;
-      const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
-      const prev = warmth.get(id);
-      // Warmth is cr-only; a completed same-prefix prior only refines the
-      // reused/grown split after cr>0 has proved warmth.
-      const { warm, prevCacheable } = deriveBaselineWarmth(
-        prev,
-        requestStartSec,
-        cacheable,
-        cr,
-        CACHE_TTL_SEC,
-        prefixSha,
-      );
-      const baselineEff = computeBaselineInputEff(
-        baseline,
-        cacheable,
-        inp,
-        cc,
-        cr,
-        warm,
-        prevCacheable,
-      );
-      const actualEff = computeActualInputEff(inp, cc, cr);
-      const tokensSaved = baselineEff - actualEff;
-      s.tokensSavedEst += Math.round(tokensSaved);
-      s.charsSaved += Math.round(tokensSaved * 4);
+    let providerStats = s.providerStats[provider];
+    if (!providerStats) {
+      providerStats = {
+        provider,
+        requests: 0,
+        compressedRequests: 0,
+        usageRequests: 0,
+        inputTokens: 0,
+        ordinaryInputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        imageTokens: 0,
+        baselineImagedTokens: 0,
+        baselineMeasuredCount: 0,
+        baselineInputWeighted: 0,
+        actualInputWeighted: 0,
+        allBaselineEquivalentWeighted: 0,
+        allActualInputWeighted: 0,
+        allOutputWeighted: 0,
+        savedInputWeighted: 0,
+        models: [],
+        serviceTiers: [],
+      };
+      s.providerStats[provider] = providerStats;
     }
-    // Record this completed row's prefix size for future cr>0 split estimates.
-    // Carry prior cacheable when this row had no probe.
-    if (haveUsage) {
-      const completionSec = Date.parse(ev.ts) / 1000;
-      const cacheable = ev.baseline_cacheable_tokens ?? 0;
-      const prefixSha = ev.system_sha8;
-      const prev = warmth.get(id);
-      warmth.set(id, {
-        ts: completionSec,
-        cacheable: cacheable > 0 ? cacheable : (prev?.cacheable ?? 0),
-        prefixSha: prefixSha ?? prev?.prefixSha,
-      });
+    providerStats.requests++;
+    if (ev.compressed === true) providerStats.compressedRequests++;
+    if (ev.model && !providerStats.models.includes(ev.model)) providerStats.models.push(ev.model);
+    if (tier && !providerStats.serviceTiers.includes(tier)) providerStats.serviceTiers.push(tier);
+    // Session telemetry is billable usage, not a speculative/error response.
+    if (acc.billableUsage) {
+      providerStats.usageRequests++;
+      providerStats.allBaselineEquivalentWeighted += acc.baselineInputEff;
+      providerStats.allActualInputWeighted += acc.actualInputEff;
+      providerStats.allOutputWeighted += acc.outputEquiv;
+      providerStats.inputTokens += ev.input_tokens ?? 0;
+      providerStats.ordinaryInputTokens += acc.ordinaryInputTokens;
+      providerStats.outputTokens += ev.output_tokens ?? 0;
+      providerStats.reasoningTokens += ev.reasoning_tokens ?? 0;
+      providerStats.cacheReadTokens += gpt ? acc.cacheReadTokens : (ev.cache_read_tokens ?? 0);
+      providerStats.cacheWriteTokens += gpt ? acc.cacheWriteTokens : (ev.cache_create_tokens ?? 0);
+      providerStats.imageTokens += ev.image_tokens ?? 0;
+      providerStats.baselineImagedTokens += ev.baseline_imaged_tokens ?? 0;
+      s.cacheReadTokens += gpt ? acc.cacheReadTokens : (ev.cache_read_tokens ?? 0);
+      s.cacheWriteTokens += gpt ? acc.cacheWriteTokens : (ev.cache_create_tokens ?? 0);
+      s.inputTokens += ev.input_tokens ?? 0;
+      s.outputTokens += ev.output_tokens ?? 0;
+      s.reasoningTokens += ev.reasoning_tokens ?? 0;
+      s.imageTokens += ev.image_tokens ?? 0;
     }
-    s.cacheReadTokens += gpt ? (ev.cached_tokens ?? 0) : (ev.cache_read_tokens ?? 0);
-    s.cacheWriteTokens += gpt ? (ev.cache_write_tokens ?? 0) : (ev.cache_create_tokens ?? 0);
-    s.inputTokens += ev.input_tokens ?? 0;
-    s.outputTokens += ev.output_tokens ?? 0;
-    s.reasoningTokens += ev.reasoning_tokens ?? 0;
-    s.imageTokens += ev.image_tokens ?? 0;
+    if (acc.creditSaving) {
+      providerStats.baselineMeasuredCount++;
+      providerStats.baselineInputWeighted += acc.baselineInputEff;
+      providerStats.actualInputWeighted += acc.actualInputEff;
+      providerStats.savedInputWeighted += acc.baselineInputEff - acc.actualInputEff;
+    }
     if (ev.req_body_sample_path) {
       let set = sidecarsBySession.get(id);
       if (!set) {
@@ -306,6 +326,14 @@ export async function aggregateSessions(
       const size = sidecarSizes.get(ev.req_body_sample_path);
       if (typeof size === 'number') s.sidecarBytes += size;
     }
+  }
+
+  // The public sessions API has historically exposed integer token/char
+  // estimates. Round after the full provider-aware fold so it agrees with the
+  // dashboard's rounded aggregate instead of accumulating per-row rounding.
+  for (const s of sessions.values()) {
+    s.tokensSavedEst = Math.round(s.tokensSavedEst);
+    s.charsSaved = Math.round(s.charsSaved);
   }
 
   return { sessions, sidecarsBySession };

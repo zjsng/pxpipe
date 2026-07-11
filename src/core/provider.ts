@@ -61,9 +61,18 @@ export function serviceTierFor(
   model?: string,
   reported?: string,
 ): string | undefined {
-  if (reported && reported.trim()) return reported.trim();
-  const m = model?.match(/(?:^|-)(sol|terra|luna)(?:-|$)/i);
-  return m?.[1]?.toLowerCase();
+  // Applicability accepts bracketed aliases such as `gpt-5.6-sol[1m]`; keep
+  // the resolved Sol/Terra/Luna variant visible in telemetry for those names
+  // too. The bracket suffix is a model variant, not a different service tier.
+  const m = model?.match(/(?:^|-)(sol|terra|luna)(?=-|\[|$)/i);
+  const modelVariant = m?.[1]?.toLowerCase();
+  const explicit = reported?.trim();
+  // Codex subscription responses commonly report service_tier="default"
+  // while the resolved model carries the useful Sol/Terra/Luna variant. Keep
+  // that variant visible instead of collapsing all three into "default".
+  // Non-generic provider tiers remain authoritative.
+  if (explicit && (!modelVariant || explicit.toLowerCase() !== 'default')) return explicit;
+  return modelVariant ?? explicit;
 }
 
 export function providerLabel(provider: ProviderId): string {

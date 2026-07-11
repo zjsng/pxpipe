@@ -167,7 +167,10 @@ void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the s
 // purpose ("lifeweight"): it answers "did pxpipe move my real, cache-discounted
 // bill since this proxy started", not a raw token count.
 export function renderSessionSummaryFragment(s: StatsPayload): string {
-  const measured = s.compressed_requests ?? 0;
+  const providerList = Object.values(s.providers ?? {});
+  const measured = providerList.length > 0
+    ? providerList.reduce((n, p) => n + (p.baseline_measured_count ?? 0), 0)
+    : (s.compressed_requests ?? 0); // legacy payloads had no provider buckets
   if (measured <= 0) {
     return (
       `<div class="hero hero-empty">` +
@@ -184,10 +187,12 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   // Input-only: pxpipe never touches output, so lumping it in just dampened the %.
   const baselineW = s.baseline_input_weighted ?? 0; // same context as text, cache-aware
   const actualW = s.actual_input_weighted ?? 0; // what we actually sent, cache-aware
-  const outMult = s.pricing_assumptions?.output_multiplier || 5;
   const hasOpenAI = Boolean(s.providers?.openai);
-  const hasAnthropic = Boolean(s.providers?.anthropic) || !hasOpenAI;
-  const rawOutput = (s.output_weighted ?? 0) / outMult; // reply — never compressed
+  const hasAnthropic = Boolean(s.providers?.anthropic);
+  const rawOutput = providerList.length > 0
+    ? providerList.reduce((n, p) => n + (p.output_tokens ?? 0), 0)
+    : (s.output_weighted ?? 0) / (s.pricing_assumptions?.output_multiplier || 5); // reply — never compressed
+  const mixedProviders = hasOpenAI && hasAnthropic;
   const inputPct = baselineW > 0 ? (1 - actualW / baselineW) * 100 : 0;
   const positive = inputPct >= 0;
   const bigNum = `${Math.abs(inputPct).toFixed(0)}%`;
@@ -195,16 +200,16 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
 
   return (
     `<div class="hero${positive ? '' : ' hero-neg'}">` +
-    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged · ${hasOpenAI && !hasAnthropic ? 'GPT / OpenAI credits' : 'provider input equivalents'}</div>` +
+    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged · ${mixedProviders ? 'provider-weighted input equivalents' : hasOpenAI ? 'GPT / OpenAI credits' : 'Claude / provider input equivalents'}</div>` +
     `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after observed provider caching</div>` +
     `<div class="hero-sub">` +
-    `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
-    `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
+    `<strong>${kFmt(actualW)}</strong> effective input units vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
+    `stayed plain text — each provider's observed cache rules are kept in its own bucket. ` +
     `Your latest messages and model output are never compressed.` +
     `</div>` +
     `<div class="hero-meta">` +
-    `Provider-aware — cached reads use the observed provider rate, not a Claude price assumption · ` +
-    `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
+    `Provider-aware — cached reads use the observed provider rate, not a cross-provider Claude price assumption · ` +
+    `output untouched (${kFmt(rawOutput)} tokens) · no $ assumptions` +
     `</div>` +
     `</div>`
   );
@@ -224,16 +229,19 @@ export function renderCurrentSessionFragment(p: CurrentSessionPayload): string {
   const cards = providers.map((s) => {
     const openai = s.provider === 'openai';
     const name = openai ? 'GPT / OpenAI' : s.provider === 'anthropic' ? 'Claude / Anthropic' : 'Other provider';
+    const readLabel = openai ? 'prompt cache read' : s.provider === 'anthropic' ? 'cache read' : 'cache telemetry read';
+    const writeLabel = s.provider === 'anthropic' ? 'cache write' : openai ? 'cache write' : 'cache telemetry write';
     const models = s.models.map(([m, n]) => `${m} ×${n}`).join(', ') || 'model not reported';
     const tiers = s.serviceTiers.map(([t, n]) => `${t} ×${n}`).join(', ');
     const saved = s.savedInputWeighted;
+    const allActual = s.allActualInputWeighted ?? s.actualInputWeighted;
     const savedLine = s.baselineMeasuredCount > 0
       ? `${numFmt(saved)} input credits ${saved >= 0 ? 'saved' : 'lost'} · ${numFmt(s.baselineMeasuredCount)} measured`
       : 'no trustworthy counterfactual yet';
     const telemetry = s.reasoningItems || s.renderCacheHits || s.renderCacheMisses || s.promptCacheKeyEvents
       ? `<span>reasoning items ${numFmt(s.reasoningItems)} (${numFmt(s.encryptedReasoningItems)} encrypted)</span><span>render cache ${numFmt(s.renderCacheHits)} hit / ${numFmt(s.renderCacheMisses)} miss</span><span>cache keys ${numFmt(s.promptCacheKeyEvents)}</span>`
       : '';
-    return `<div class="session-provider"><div class="session-provider-head"><strong>${name}</strong><span>${numFmt(s.requests)} requests · ${numFmt(s.compressedRequests)} imaged</span></div><div class="session-model"><code>${escapeHtml(models)}</code>${tiers ? ` · tier ${escapeHtml(tiers)}` : ''}</div><div class="session-metrics"><span>input ${numFmt(s.inputTokens)}</span><span>output ${numFmt(s.outputTokens)}</span><span>reasoning ${numFmt(s.reasoningTokens)}</span><span>${openai ? 'prompt cache read' : 'cache read'} ${numFmt(s.cacheReadTokens)}</span><span>cache write ${numFmt(s.cacheWriteTokens)}</span>${openai ? `<span>image ${numFmt(s.imageTokens)} · text base ${numFmt(s.baselineImagedTokens)}</span>` : ''}${telemetry}</div><div class="session-saved">${savedLine}${openai ? ' · GPT credits only; no USD conversion' : ''}</div></div>`;
+    return `<div class="session-provider"><div class="session-provider-head"><strong>${name}</strong><span>${numFmt(s.requests)} requests · ${numFmt(s.compressedRequests)} imaged</span></div><div class="session-model"><code>${escapeHtml(models)}</code>${tiers ? ` · tier ${escapeHtml(tiers)}` : ''}</div><div class="session-metrics"><span>input ${numFmt(s.inputTokens)}</span>${openai ? `<span>ordinary input ${numFmt(s.ordinaryInputTokens)}</span>` : ''}<span>all paid input units ${numFmt(allActual)}</span><span>output ${numFmt(s.outputTokens)}</span><span>reasoning ${numFmt(s.reasoningTokens)}</span><span>${readLabel} ${numFmt(s.cacheReadTokens)}</span><span>${writeLabel} ${numFmt(s.cacheWriteTokens)}</span>${openai ? `<span>image ${numFmt(s.imageTokens)} · text base ${numFmt(s.baselineImagedTokens)}</span>` : ''}${telemetry}</div><div class="session-saved">${savedLine}${openai ? ' · GPT credits only; no USD conversion' : ''}</div></div>`;
   }).join('');
   return `<div class="current-session"><div class="current-session-head"><span>Current session</span><code>${escapeHtml(p.sessionId)}</code><span class="hint">restored/live · provider totals</span></div><div class="session-providers">${cards}</div></div>`;
 }
@@ -271,20 +279,27 @@ function statTile(
 
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
-  const hasOpenAI = Boolean(s.providers?.openai);
-  const hasAnthropic = Boolean(s.providers?.anthropic) || !hasOpenAI;
-  const unitLabel = hasOpenAI ? 'Input credits saved' : 'Input tokens saved';
+  const openai = s.providers?.openai;
+  const anthropic = s.providers?.anthropic;
+  const hasOpenAI = Boolean(openai);
+  const hasAnthropic = Boolean(anthropic);
+  const mixed = hasOpenAI && hasAnthropic;
+  const unitLabel = mixed
+    ? 'Provider-weighted input units saved'
+    : hasOpenAI ? 'GPT input credits saved' : 'Claude input units saved';
+  const claudeSaved = anthropic?.saved_input_weighted ?? 0;
+  const gptSaved = openai?.saved_input_weighted ?? 0;
   const savedTile = hasAnthropic
     ? statTile(
         'Estimated Claude input saved',
         `$${(s.saved_usd ?? 0).toFixed(2)}`,
         `at $${pa.input_per_mtok}/M Anthropic input tokens`,
-        '',
+        (s.saved_usd ?? 0) < 0 ? 'neg' : 'pos',
         'Claude / Anthropic only. GPT / Codex usage is never converted with this rate.',
       )
     : statTile(
-        'Estimated USD saved',
-        'not priced',
+        'USD conversion',
+        'not available',
         'GPT / Codex subscription pricing is not exposed',
         'muted-val',
         'No monetary conversion is claimed for GPT / Codex. Use the provider-credit and token telemetry instead.',
@@ -296,22 +311,22 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pAvg = s.passthrough_avg_usd_per_request ?? 0;
   const costTile = !hasAnthropic
     ? statTile(
-        'Claude cost per request',
-        'not applicable',
+        'USD cost per request',
+        'not available',
         'GPT / Codex shown as provider credits below',
         'muted-val',
         'The proxy does not have an exact monetary rate for this GPT / Codex subscription transport.',
       )
     : splitReady
     ? statTile(
-        'Cost per request',
+        'Claude cost per request',
         `$${cAvg.toFixed(4)}`,
         `vs $${pAvg.toFixed(4)} without pxpipe`,
         cAvg <= pAvg ? 'pos' : 'neg',
         'Average real cost of a request with imaging on vs off (passthrough), measured on your own traffic.',
       )
     : statTile(
-        'Cost per request',
+        'Claude cost per request',
         'collecting…',
         `${numFmt(s.compressed_paid_requests)} imaged · ${numFmt(s.passthrough_paid_requests)} passthrough so far`,
         'muted-val',
@@ -324,8 +339,8 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     statTile(
       unitLabel,
       numFmt(s.saved_input_tokens),
-      hasOpenAI ? 'provider billing-equivalent units; no cross-provider USD' : 'vs sending the same context as text',
-      'pos',
+      mixed ? 'Claude + GPT buckets below; not one currency' : hasOpenAI ? 'provider billing-equivalent units; no cross-provider USD' : 'vs sending the same context as text',
+      (s.saved_input_tokens ?? 0) < 0 ? 'neg' : 'pos',
       'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — recent turns and the live output stay text.',
     ) +
     savedTile +
@@ -333,19 +348,24 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `</div>`;
 
   // math drawer
+  const inputFormula = mixed
+    ? 'provider-specific counterfactual input − provider-specific actual input'
+    : hasOpenAI
+      ? 'GPT text counterfactual − GPT image input (ordinary/cache/write weights)'
+      : 'Claude input + cache_create×1.25 + cache_read×0.10';
   const savedMath =
     `<div><span class="k">formula:</span> <span class="v">provider saved credits = counterfactual − actual</span></div>` +
-    `<div><span class="k">weights:</span> <span class="v">${hasOpenAI && !hasAnthropic ? 'GPT ordinary×1.0, cached≈0.1, write≈1.25, output≈8; image tokens vs o200k text baseline' : 'Claude input×1.0, cache_create×1.25, cache_read×0.10'}</span></div>` +
+    `<div><span class="k">weights:</span> <span class="v">${mixed ? 'Each provider is calculated separately; see provider buckets.' : hasOpenAI ? 'GPT ordinary×1.0, cached≈0.1, write≈1.25, model-specific output; image tokens vs o200k text baseline' : 'Claude input×1.0, cache_create×1.25, cache_read×0.10'}</span></div>` +
     `<div class="sp"></div>` +
-    mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable×weight + cold_tail)') +
-    mathRow('actual', s.actual_input_weighted, '(input + cc×1.25 + cr×0.10 from usage)') +
+    mathRow('baseline', s.baseline_input_weighted, `(${inputFormula})`) +
+    mathRow('actual', s.actual_input_weighted, `(${hasOpenAI ? 'provider-weighted input from usage' : 'input + cc×1.25 + cr×0.10 from usage'})`) +
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
-    `<span class="src">output is untouched and shown separately; provider buckets prevent cross-provider pricing</span>`;
+    `<span class="src">output is untouched and shown separately; provider buckets prevent cross-provider pricing${mixed ? ` · Claude saved ${numFmt(claudeSaved)} · GPT saved ${numFmt(gptSaved)}` : ''}</span>`;
 
   const usdMath = hasAnthropic
     ? `<div><span class="k">formula:</span> <span class="v">Claude $ saved = Claude saved input equivalents × $${pa.input_per_mtok}/Mtok</span></div>` +
       `<div class="sp"></div>` +
-      mathRow('Claude_saved_tokens', s.saved_input_tokens, '(provider bucket; cache-aware, input-side)') +
+      mathRow('Claude_saved_tokens', claudeSaved, '(provider bucket; cache-aware, input-side)') +
       mathRow('Claude_saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> Claude saved × input_rate / 1e6`) +
       `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')} · GPT / Codex excluded</span>`
     : `<div><span class="k">formula:</span> <span class="v">USD conversion unavailable for GPT / Codex subscription traffic</span></div>` +
@@ -371,22 +391,22 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
       `<span class="src">No exact GPT / Codex USD per request is available. See provider buckets for cached reads, writes, output/reasoning, and image tokens.</span>`;
 
   const pctMath =
-    `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (provider-specific counterfactual bill)</span></div>` +
     `<div><span class="k">diagnostic, not the headline:</span> <span class="v">this is a counterfactual ("what you WOULD have paid"). It leans on the count_tokens probe, the cache-aware split, and an input-rate assumption. Useful as a sanity check; the real-traffic answer is the compressed-vs-passthrough split above.</span></div>` +
     `<div class="sp"></div>` +
     mathRow('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
     mathRow('all_baseline_equivalent', s.all_baseline_equivalent_weighted, '(every paid request; baseline on measured + actual on the rest)') +
-    mathRow(`all_output × ${pa.output_multiplier}`, s.all_output_weighted, '(every paid request)') +
+    mathRow('all_output (provider-specific rate)', s.all_output_weighted, '(every paid request)') +
     mathRow('share_of_spend', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> saved / counterfactual_total × 100`) +
     mathRow('all_usage_requests', s.all_usage_requests, '(denominator request count — compressed + passthrough + probe-failed)') +
     `<span class="src">provider input-credit diagnostic; do not compare across Claude and GPT as dollars</span>`;
 
   const tokeqMath =
-    `<div><span class="k">formula:</span> <span class="v">provider input-credit equivalent = input + provider output multiplier</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">provider input-credit equivalent = input + provider-specific output multiplier</span></div>` +
     `<div><span class="k">why:</span> <span class="v">Claude uses its documented input/output ratio; GPT / Codex uses telemetry credits and is not converted to Claude dollars.</span></div>` +
     `<div class="sp"></div>` +
     mathRow('actual_token_equivalent', s.actual_token_equivalent) +
-    mathRow('baseline_token_equivalent', s.baseline_token_equivalent, `(unproxied counterfactual, same ×${pa.output_multiplier} on output)`) +
+    mathRow('baseline_token_equivalent', s.baseline_token_equivalent, '(unproxied counterfactual; provider-specific output rates)') +
     `<div class="sp"></div>` +
     mathRow('events_with_measurement', s.events_with_measurement, '(events where the SSE/JSON scanner produced char counts)') +
     mathRow('measured_text_chars', s.measured_text_chars, '') +
@@ -619,7 +639,7 @@ export function renderRecentFragment(p: RecentPayload): string {
             const provider = e.provider === 'openai'
               ? 'GPT / OpenAI'
               : e.provider === 'other' ? 'Other' : 'Claude / Anthropic';
-            const tier = e.service_tier ? ` · ${escapeHtml(e.service_tier)}` : '';
+            const tier = e.service_tier ? ` · tier ${escapeHtml(e.service_tier)}` : '';
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
             const viewLink =
               viewId != null
@@ -652,7 +672,7 @@ export function renderRecentFragment(p: RecentPayload): string {
               ? `<span class="badge badge-bad">error</span>`
               : e.sent_as === 'image' || e.cc_added
                 ? `<span class="badge badge-img">image</span>`
-                : `<span class="badge badge-txt">text</span>`;
+                : `<span class="badge badge-txt">passthrough</span>`;
             const cacheRead = e.cache_read ?? e.cached_tokens;
             const cacheWrite = e.cache_write ?? e.cache_create;
             const output = e.output_tokens;
@@ -664,6 +684,10 @@ export function renderRecentFragment(p: RecentPayload): string {
                 : numFmt(output);
             const stop = e.stop_reason ? ` <span class="stop" title="stop/refusal status">${escapeHtml(e.stop_reason)}</span>` : '';
             const telemetry = [
+              e.reason ? `reason ${e.reason}` : '',
+              e.error ? `error ${e.error}` : '',
+              e.error_body ? `upstream: ${e.error_body.slice(0, 180)}` : '',
+              e.ordinary_input_tokens != null ? `ordinary input ${numFmt(e.ordinary_input_tokens)}` : '',
               e.reasoning_items != null ? `reasoning items ${e.reasoning_items}/${e.encrypted_reasoning_items ?? 0} encrypted` : '',
               e.reasoning_effort ? `effort ${e.reasoning_effort}` : '',
               e.reasoning_context ? `context ${e.reasoning_context}` : '',
@@ -673,7 +697,7 @@ export function renderRecentFragment(p: RecentPayload): string {
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
-              `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
+              `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span>${e.safety_flagged ? ` <span class="badge badge-bad" title="provider safety/refusal result; savings comparison withheld">safety/refusal</span>` : ''}</td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
               `<td><span class="provider">${provider}</span>${e.model ? `<br><code>${escapeHtml(e.model)}</code>` : ''}${tier}${stop}${telemetry ? `<br><span class="telemetry">${escapeHtml(telemetry)}</span>` : ''}</td>` +
               `<td>${imaged}${e.image_tokens != null && e.image_tokens > 0 ? `<span class="img-tokens" title="rendered image input tokens"> · ${numFmt(e.image_tokens)} img tok</span>` : ''}</td>` +
@@ -694,7 +718,7 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>Result</th>` +
     `<th>Endpoint</th>` +
     `<th>Provider / model</th>` +
-    `<th title="Was this request's context compressed into an image?">Sent as</th>` +
+    `<th title="Whether pxpipe imaged the context or forwarded the request as passthrough text">Sent as / path</th>` +
     `<th class="num" title="Prompt/cache tokens reported as reused by the upstream provider">Cache read</th>` +
     `<th class="num" title="Prompt/cache tokens written or created this turn">Cache write</th>` +
     `<th class="num" title="Provider-specific billing-equivalent input if kept as plain text; GPT is credit-equivalent, not Claude dollars">As text</th>` +
@@ -795,6 +819,18 @@ export function renderSessionsFragment(p: SessionsPayload): string {
     const models = s.models?.slice(0, 2).join(', ');
     return models ? `${base} · ${models}` : base;
   };
+  const providerDetail = (s: SessionRow) => Object.values(s.providerStats ?? {})
+    .map((p) => {
+      const name = p.provider === 'openai' ? 'GPT' : p.provider === 'anthropic' ? 'Claude' : 'Other';
+      const variants = p.serviceTiers?.join(', ') || p.models?.join(', ') || 'unknown variant';
+      const cacheLabel = p.provider === 'openai' ? 'prompt read' : 'cache read';
+      const inputDetail = p.provider === 'openai'
+        ? ` · ordinary ${numFmt(p.ordinaryInputTokens)} · ${cacheLabel} ${numFmt(p.cacheReadTokens)} · write ${numFmt(p.cacheWriteTokens)}`
+        : ` · ${cacheLabel} ${numFmt(p.cacheReadTokens)} · write ${numFmt(p.cacheWriteTokens)}`;
+      const imageDetail = p.provider === 'openai' ? ` · image ${numFmt(p.imageTokens)}` : '';
+      return `${name}: ${numFmt(p.savedInputWeighted)} credits saved · ${numFmt(p.requests)} req${inputDetail} · output ${numFmt(p.outputTokens)} / reasoning ${numFmt(p.reasoningTokens)}${imageDetail} · ${variants}`;
+    })
+    .join(' · ');
   const barPct = (v: number) => (max <= 0 || v <= 0 ? 0 : (v / max) * 100);
 
   const status = `<div class="status">${all.length} session${all.length === 1 ? '' : 's'} tracked</div>`;
@@ -807,9 +843,9 @@ export function renderSessionsFragment(p: SessionsPayload): string {
       const fill = pct > 0 ? `<div class="bar-fill" style="width:max(3px,${pct}%)"></div>` : '';
       return (
         `<div class="bar-row">` +
-        `<div class="bar-label" title="${escapeHtml((s.claudeCode?.projectPath || s.project || s.id) + (s.models?.length ? ` · models: ${s.models.join(', ')}` : ''))}">${escapeHtml(label(s))}</div>` +
+        `<div class="bar-label" title="${escapeHtml((s.claudeCode?.projectPath || s.project || s.id) + (s.models?.length ? ` · models: ${s.models.join(', ')}` : '') + (providerDetail(s) ? ` · ${providerDetail(s)}` : ''))}">${escapeHtml(label(s))}</div>` +
         `<div class="bar-track">${fill}</div>` +
-        `<div class="bar-val${v < 0 ? ' neg' : ''}">${numFmt(v)} credits</div>` +
+        `<div class="bar-val${v < 0 ? ' neg' : ''}">${numFmt(v)} credits${providerDetail(s) ? `<small>${escapeHtml(providerDetail(s))}</small>` : ''}</div>` +
         `</div>`
       );
     })
@@ -818,7 +854,7 @@ export function renderSessionsFragment(p: SessionsPayload): string {
   return (
     status +
     `<div class="bars">${chart}</div>` +
-    `<div class="axis">provider input credits saved per session (cache-aware; GPT is not converted to Claude USD) · top ${rows.length} of ${all.length}</div>`
+    `<div class="axis">provider input-credit equivalents saved per session (cache-aware; provider buckets below are separate, GPT is not converted to Claude USD) · top ${rows.length} of ${all.length}</div>`
   );
 }
 
@@ -829,12 +865,8 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     return `<div class="status">${escapeHtml(p.error || 'no data')}</div><table class="dtable"><tbody></tbody></table>`;
   }
   const s = p.summary;
-  const totalIn = (s.inputTokensTotal || 0) + (s.cacheCreateTokensTotal || 0) + (s.cacheReadTokensTotal || 0);
-  const hitRateTok = totalIn > 0 ? ((s.cacheReadTokensTotal / totalIn) * 100).toFixed(1) + '%' : '-';
-  const hitRateEv =
-    s.eventsWithBaseline > 0 ? ((s.cacheHitEvents / s.eventsWithBaseline) * 100).toFixed(1) + '%' : '-';
   const charRatio =
-    s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
+    s.origCharsTotal > 0 ? (s.imageBytesTotal / s.origCharsTotal).toFixed(3) + 'x' : '-';
 
   // NOTE: the literal word "requests" is asserted by tests.
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;
@@ -842,9 +874,15 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     const name = p.provider === 'openai' ? 'GPT / OpenAI' : p.provider === 'anthropic' ? 'Claude / Anthropic' : 'Other';
     const models = (p.models ?? []).map(([m, n]) => `${m} ×${n}`).join(', ') || '—';
     const tiers = (p.serviceTiers ?? []).map(([t, n]) => `${t} ×${n}`).join(', ');
-      const render = p.renderCacheHits != null ? ` · render ${numFmt(p.renderCacheHits)} hit/${numFmt(p.renderCacheMisses)} miss` : '';
-      const reasoning = p.reasoningItemsTotal ? ` · ${numFmt(p.reasoningItemsTotal)} reasoning items` : '';
-      return `<tr><td>${name}</td><td><code>${escapeHtml(models)}</code>${tiers ? `<br><span class="muted">${escapeHtml(tiers)}</span>` : ''}${render || reasoning ? `<br><span class="muted">${escapeHtml((render + reasoning).replace(/^ · /, ''))}</span>` : ''}</td><td class="num">${numFmt(p.inputTokensTotal)}</td><td class="num">${numFmt(p.outputTokensTotal)}</td><td class="num">${numFmt(p.reasoningTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cachedTokensTotal : p.cacheReadTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cacheWriteTokensTotal : p.cacheCreateTokensTotal)}</td><td class="num">${numFmt(p.imageTokensTotal)}</td><td>${numFmt(p.ok2xx)} ok · ${numFmt(p.err4xx + p.err5xx)} errors${p.safetyFlagged ? ` · ${numFmt(p.safetyFlagged)} safety` : ''}</td></tr>`;
+    const stops = (p.stopReasons ?? []).map(([r, n]) => `${r} ×${n}`).join(', ');
+    const render = p.renderCacheHits != null ? ` · render ${numFmt(p.renderCacheHits)} hit/${numFmt(p.renderCacheMisses)} miss` : '';
+    const reasoning = p.reasoningItemsTotal ? ` · ${numFmt(p.reasoningItemsTotal)} reasoning items` : '';
+    const read = p.provider === 'openai' ? p.cachedTokensTotal : p.cacheReadTokensTotal;
+    const write = p.provider === 'openai' ? p.cacheWriteTokensTotal : p.cacheCreateTokensTotal;
+    const cacheName = p.provider === 'openai' ? 'prompt-cache' : p.provider === 'anthropic' ? 'cache' : 'cache telemetry';
+    const hitRate = p.eventsWithUsage > 0 ? ((p.cacheHitEvents / p.eventsWithUsage) * 100).toFixed(1) + '%' : '—';
+    const saved = p.savedInputWeighted == null ? '—' : `${numFmt(p.savedInputWeighted)} ${p.provider === 'openai' ? 'GPT credits' : 'input eq.'}`;
+    return `<tr><td>${name}</td><td><code>${escapeHtml(models)}</code>${tiers ? `<br><span class="muted">tier/variant: ${escapeHtml(tiers)}</span>` : ''}${stops ? `<br><span class="muted">stop: ${escapeHtml(stops)}</span>` : ''}${render || reasoning ? `<br><span class="muted">${escapeHtml((render + reasoning).replace(/^ · /, ''))}</span>` : ''}</td><td class="num">${numFmt(p.inputTokensTotal)}</td><td class="num">${numFmt(p.outputTokensTotal)} / ${numFmt(p.reasoningTokensTotal)}</td><td class="num">${numFmt(read)}</td><td class="num">${numFmt(write)}</td><td class="num">${numFmt(p.imageTokensTotal)}</td><td class="num">${escapeHtml(saved)}<br><span class="muted">${escapeHtml(cacheName)} hit ${hitRate}</span></td><td>${numFmt(p.ok2xx)} ok · ${numFmt(p.err4xx + p.err5xx)} errors${p.safetyFlagged ? ` · ${numFmt(p.safetyFlagged)} safety` : ''}</td></tr>`;
   }).join('');
   return (
     `<div class="status">${numFmt(p.parsed)} events parsed from disk</div>` +
@@ -853,11 +891,10 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('2xx / 4xx / 5xx', `${numFmt(s.ok2xx)} / ${numFmt(s.err4xx)} / ${numFmt(s.err5xx)}`) +
     tr('compressed', numFmt(s.compressed)) +
     tr('passthrough', numFmt(s.passthrough)) +
-    tr('input tokens', numFmt(s.inputTokensTotal)) +
-    tr('cache create', numFmt(s.cacheCreateTokensTotal)) +
-    tr('cache read', numFmt(s.cacheReadTokensTotal)) +
-    tr('Claude cache hit (by tokens)', hitRateTok) +
-    tr('Claude cache hit (by events)', hitRateEv) +
+    tr('input tokens (all providers)', numFmt(s.inputTokensTotal)) +
+    tr('output tokens (all providers)', numFmt(s.outputTokensTotal)) +
+    tr('provider input credits saved', s.savedInputWeighted == null ? '—' : numFmt(s.savedInputWeighted)) +
+    tr('measured counterfactual rows', numFmt(s.baselineMeasuredCount ?? 0)) +
     tr('original chars', numFmt(s.origCharsTotal)) +
     tr('image bytes', numFmt(s.imageBytesTotal)) +
     tr('bytes / char', charRatio) +
@@ -865,10 +902,10 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('first-byte p50 / p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
     `</tbody></table>` +
     `<h3 class="card-head spaced">Provider telemetry</h3>` +
-    `<table class="dtable"><thead><tr><th>provider</th><th>models / tiers</th><th class="num">input</th><th class="num">output</th><th class="num">reasoning</th><th class="num">cache read</th><th class="num">cache write</th><th class="num">image tokens</th><th class="num">status</th></tr></thead><tbody>` +
+    `<table class="dtable"><thead><tr><th>provider</th><th>models / tiers / telemetry</th><th class="num">input</th><th class="num">output / reasoning</th><th class="num">prompt/cache read</th><th class="num">prompt/cache write</th><th class="num">image tokens</th><th class="num">saved/lost + hit rate</th><th class="num">status</th></tr></thead><tbody>` +
     (providerRows || `<tr><td colspan="9" class="empty-cell">No provider telemetry yet.</td></tr>`) +
     `</tbody></table>` +
-    `<div class="status provider-footnote">GPT / Codex values are provider telemetry and credit-equivalents only; no Anthropic USD conversion is claimed.</div>`
+    `<div class="status provider-footnote">Claude cache fields use Anthropic terminology and rates; GPT/Codex fields use prompt-cache telemetry and provider-credit equivalents. No GPT value is converted to Anthropic USD, and mixed-provider totals are not a single currency.</div>`
   );
 }
 
@@ -891,15 +928,15 @@ const FAVICON =
 
 const CSS = `
   :root {
-    --bg: #faf6f2; --surface: #ffffff; --surface-2: #fbf4ee;
-    --border: #efe5db; --border-strong: #e4d6c8;
-    --ink: #241f1b; --ink-2: #5d534a; --muted: #9b9189;
+    --bg: #f0ebe4; --surface: #fffdf9; --surface-2: #f7f1e9;
+    --border: #ded4c9; --border-strong: #c7b8a9;
+    --ink: #211b17; --ink-2: #62564c; --muted: #95887d;
     --flame: #ff5a1f; --flame-strong: #e8420a; --flame-ink: #bd3a08; --flame-tint: #fff1ea;
     --good: #1f9d57; --good-tint: #e7f6ee; --bad: #d8483b; --bad-tint: #fcebe9; --warn: #b7791f; --warn-tint: #fbf0db;
     --img: #ff5a1f; --img-ink: #bd3a08; --img-tint: #fff1ea;
     --txt: #2f7db0; --txt-ink: #1f5f8b; --txt-tint: #e9f3fb;
-    --radius: 14px;
-    --shadow: 0 1px 2px rgba(60,35,15,.05), 0 8px 24px rgba(60,35,15,.05);
+    --radius: 10px;
+    --shadow: 0 1px 0 rgba(60,35,15,.05), 0 12px 30px rgba(60,35,15,.045);
     --mono: 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color-scheme: light;
   }
@@ -907,14 +944,14 @@ const CSS = `
      paint by the <head> script (localStorage 'pp-theme' else system pref);
      toggled by ppTheme(). Accents (flame/img/txt) are lifted for contrast. */
   :root[data-theme="dark"] {
-    --bg: #17120f; --surface: #211a15; --surface-2: #2a211b;
-    --border: #352a22; --border-strong: #46382e;
+    --bg: #12110f; --surface: #1c1916; --surface-2: #26211d;
+    --border: #342c25; --border-strong: #504238;
     --ink: #f6efe8; --ink-2: #cabbac; --muted: #9a8c7d;
     --flame: #ff6a33; --flame-strong: #e8420a; --flame-ink: #ff9a63; --flame-tint: #3a2318;
     --good: #3fbd76; --good-tint: #15291f; --bad: #f0645a; --bad-tint: #341b18; --warn: #d99a3a; --warn-tint: #33260f;
     --img: #ff6a33; --img-ink: #ff9a63; --img-tint: #3a2318;
     --txt: #5aa3d6; --txt-ink: #8cc3ea; --txt-tint: #142631;
-    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.45);
+    --shadow: 0 1px 0 rgba(0,0,0,.45), 0 14px 32px rgba(0,0,0,.28);
     color-scheme: dark;
   }
   /* Dark fix-ups for the few intentionally hard-coded (light) spots. */
@@ -922,8 +959,10 @@ const CSS = `
   :root[data-theme="dark"] .banner strong { color: #ffd6cf; }
   :root[data-theme="dark"] .toast { box-shadow: 0 8px 24px rgba(0,0,0,.5); }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 22px 26px 64px; background: var(--bg); color: var(--ink-2);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  html { background: var(--bg); }
+  body { max-width: 1600px; min-height: 100vh; margin: 0 auto; padding: 30px clamp(24px, 3.2vw, 52px) 80px;
+    background: radial-gradient(circle at 100% 0%, rgba(255,90,31,.075), transparent 28rem), var(--bg); color: var(--ink-2);
+    font: 14px/1.55 'Avenir Next', 'Segoe UI', sans-serif;
     -webkit-font-smoothing: antialiased; }
   b, strong { color: var(--ink); }
   .good { color: var(--good); } .bad { color: var(--bad); }
@@ -931,83 +970,90 @@ const CSS = `
 
   /* topbar */
   .topbar { display: flex; align-items: flex-start; justify-content: space-between;
-    gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+    gap: 28px; flex-wrap: wrap; margin-bottom: 26px; padding-bottom: 22px; border-bottom: 1px solid var(--border); }
   .brand { display: flex; align-items: center; gap: 12px; }
-  .flame-dot { width: 14px; height: 14px; border-radius: 50%;
+  .flame-dot { width: 16px; height: 16px; border-radius: 50%;
     background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
-    box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
-  .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
-  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
-  .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+    box-shadow: 0 0 0 5px var(--flame-tint); flex: none; }
+  .wordmark-kicker { color: var(--flame-ink); font: 700 9px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; margin-bottom: 6px; }
+  .wordmark { font-family: 'Iowan Old Style', Baskerville, Georgia, serif; font-size: 29px; font-weight: 700; color: var(--ink); letter-spacing: -0.04em; line-height: 1; }
+  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 7px; max-width: 520px; line-height: 1.4; }
+  .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; }
 
   /* kill switch */
-  .banner { display: block; margin: 0 0 8px; padding: 9px 13px; background: var(--bad-tint);
-    border: 1px solid #f3b6af; border-radius: 9px; color: #9c2b20; font-size: 12px; max-width: 520px; }
+  .banner { display: block; margin: 0 0 10px; padding: 10px 14px; background: var(--bad-tint);
+    border: 1px solid #f3b6af; border-left: 3px solid var(--bad); border-radius: 6px; color: #9c2b20; font-size: 12px; max-width: 620px; }
   .banner strong { color: #8a2117; }
   .switch { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
-  .switch-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
-    padding: 3px 10px; border-radius: 999px; }
+  .switch-state { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    padding: 5px 10px; border-radius: 5px; }
   .switch-state.on { color: var(--good); background: var(--good-tint); }
   .switch-state.off { color: var(--bad); background: var(--bad-tint); }
   .switch-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
   .switch-btn { background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong);
-    padding: 6px 13px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600;
-    box-shadow: var(--shadow); }
+    padding: 7px 13px; cursor: pointer; border-radius: 5px; font: inherit; font-size: 12px; font-weight: 600;
+    box-shadow: none; }
   .switch-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
   .hint { color: var(--muted); font-size: 11px; }
-  .theme-btn { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
-    padding: 5px 11px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600;
-    box-shadow: var(--shadow); display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
+  .theme-btn { background: transparent; color: var(--ink-2); border: 1px solid var(--border-strong);
+    padding: 7px 11px; cursor: pointer; border-radius: 5px; font: inherit; font-size: 12px; font-weight: 600;
+    box-shadow: none; display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
   .theme-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
 
   /* model chips */
-  .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
-  .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  #frag-models { padding: 15px 0 3px; border-bottom: 1px solid var(--border); }
+  .models { display: flex; flex-wrap: wrap; align-items: center; gap: 9px 10px; margin: 0 0 12px; }
+  .models-label { color: var(--muted); font: 700 10px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
   .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
-    border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 12px; }
+    border-radius: 5px; padding: 5px 11px; cursor: pointer; font: inherit; font-size: 12px; }
   .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
   .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
     font-weight: 600; }
 
   /* session hero */
-  #frag-session { display: block; margin-bottom: 16px; }
-  .hero { background: linear-gradient(135deg, var(--flame-tint), var(--surface) 60%); border: 1px solid var(--border);
-    border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 20px 24px; box-shadow: var(--shadow); }
+  #frag-session { display: block; margin: 25px 0 20px; }
+  .hero { position: relative; overflow: hidden; background: linear-gradient(135deg, var(--flame-tint), var(--surface) 62%); border: 1px solid var(--border);
+    border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 32px 36px; box-shadow: var(--shadow); }
+  .hero::after { content: ''; position: absolute; width: 260px; height: 260px; right: -72px; top: -122px; border: 1px solid var(--flame); border-radius: 50%; opacity: .18; box-shadow: 0 0 0 22px transparent, 0 0 0 23px var(--flame); }
+  .hero > * { position: relative; z-index: 1; }
   .hero-neg { border-left-color: var(--bad); }
   .hero-eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
     color: var(--muted); margin-bottom: 8px; }
-  .hero-headline { font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; line-height: 1.1; }
-  .hero-num { font-size: 56px; font-weight: 800; line-height: 1; margin-right: 8px;
+  .hero-headline { max-width: 980px; font-size: 31px; font-weight: 700; color: var(--ink); letter-spacing: -0.03em; line-height: 1.15; }
+  .hero-num { font-size: 66px; font-weight: 800; line-height: .9; margin-right: 9px;
     background: linear-gradient(135deg, #ff9a4d, var(--flame) 55%, var(--flame-strong));
     -webkit-background-clip: text; background-clip: text; color: transparent;
     font-variant-numeric: tabular-nums; }
   .hero-neg .hero-num { background: linear-gradient(135deg, #f0857a, var(--bad));
     -webkit-background-clip: text; background-clip: text; color: transparent; }
-  .hero-sub { font-size: 14.5px; color: var(--ink-2); margin-top: 12px; max-width: 720px; }
-  .hero-meta { font-size: 12px; color: var(--muted); margin-top: 10px; padding-top: 10px;
+  .hero-sub { font-size: 15px; color: var(--ink-2); margin-top: 18px; max-width: 820px; }
+  .hero-meta { font-size: 12.5px; color: var(--muted); margin-top: 14px; padding-top: 14px;
     border-top: 1px dashed var(--border-strong); }
   .hero-empty .hero-headline { color: var(--muted); font-size: 24px; }
-  .current-session { margin: 0 0 16px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 12px 16px; box-shadow: var(--shadow); }
-  .current-session-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; color: var(--ink-2); font-size: 12px; font-weight: 700; margin-bottom: 9px; }
+  .current-session { margin: 0 0 20px; background: var(--surface); border: 1px dashed var(--border-strong);
+    border-radius: var(--radius); padding: 17px 20px; box-shadow: none; }
+  .current-session-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--ink-2); font-size: 12.5px; font-weight: 700; margin-bottom: 12px; }
   .current-session-head code { color: var(--flame-ink); font-weight: 600; }
-  .session-providers { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 9px; }
-  .session-provider { background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; padding: 9px 11px; min-width: 0; }
+  .session-providers { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .session-provider { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; min-width: 0; }
   .session-provider-head { display: flex; justify-content: space-between; gap: 8px; color: var(--ink); font-size: 12px; }
   .session-provider-head span, .session-model, .session-metrics, .session-saved { color: var(--muted); font-size: 10.5px; }
   .session-model { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-metrics { display: flex; flex-wrap: wrap; gap: 4px 9px; margin-top: 7px; }
-  .session-saved { margin-top: 7px; color: var(--flame-ink); font-weight: 600; }
+  .session-metrics { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 9px; }
+  .session-saved { margin-top: 9px; color: var(--flame-ink); font-weight: 600; }
 
   /* stat strip */
-  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
+  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 20px; }
   @media (max-width: 1000px) { .strip { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 560px) { .strip { grid-template-columns: 1fr; } }
-  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 14px 16px; box-shadow: var(--shadow); }
-  .tile-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 8px;
+  .tile { background: var(--surface); border: 1px solid var(--border); border-top: 3px solid var(--border-strong); border-radius: 8px;
+    padding: 17px 20px 19px; box-shadow: none; }
+  .tile:nth-child(2) { border-top-color: var(--flame); }
+  .tile:nth-child(3) { border-top-color: var(--good); }
+  .tile:nth-child(4) { border-top-color: var(--txt); }
+  .tile-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 10px;
     display: flex; align-items: center; gap: 5px; }
-  .tile-value { font-size: 26px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums;
+  .tile-value { font-size: 28px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums;
     letter-spacing: -0.01em; line-height: 1.1; }
   .tile-value.pos { color: var(--good); } .tile-value.neg { color: var(--bad); }
   .tile-value.muted-val { color: var(--muted); font-size: 18px; font-weight: 600; }
@@ -1028,17 +1074,17 @@ const CSS = `
   .q:hover::before, .q:focus-visible::before { opacity: 1; visibility: visible; }
 
   /* drawer */
-  .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
-  .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 12px 16px;
+  .drawer { margin: 0 0 20px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; box-shadow: none; overflow: hidden; }
+  .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 15px 20px;
     font-size: 13px; font-weight: 600; color: var(--flame-ink); display: flex; align-items: center; gap: 8px; }
   .drawer > summary::-webkit-details-marker { display: none; }
   .drawer > summary::before { content: '▸'; color: var(--flame); font-size: 11px; }
   .drawer[open] > summary::before { content: '▾'; }
   .drawer > summary:hover { background: var(--surface-2); }
-  .drawer-intro { padding: 0 16px 10px; font-size: 12px; color: var(--ink-2); }
+  .drawer-intro { padding: 0 20px 14px; font-size: 12px; color: var(--ink-2); }
   .drawer-intro em { color: var(--flame-ink); font-style: normal; font-weight: 600; }
-  .math-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding: 0 16px 16px; }
+  .math-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; padding: 0 20px 20px; }
   @media (max-width: 860px) { .math-grid { grid-template-columns: 1fr; } }
   .math-block h4 { margin: 0 0 6px; font-size: 12px; color: var(--ink); }
   .formula { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
@@ -1053,19 +1099,23 @@ const CSS = `
   @keyframes pulse { 50% { opacity: 0.35; } }
 
   /* sections */
-  .section { margin-top: 26px; }
-  .section-head { font-size: 14px; font-weight: 700; color: var(--ink); margin: 0 0 12px;
-    display: flex; align-items: baseline; gap: 10px; }
-  .section-sub { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .section { margin-top: 40px; }
+  .section-head { font: 700 11px/1.3 var(--mono); letter-spacing: .075em; text-transform: uppercase; color: var(--ink-2); margin: 0 0 15px;
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .section-sub { font: 400 11px/1.4 'Avenir Next', 'Segoe UI', sans-serif; letter-spacing: 0; text-transform: none; color: var(--muted); }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
-  .card-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--muted); margin: 0 0 12px; }
-  .card-head.spaced { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
+    padding: 24px 26px; box-shadow: var(--shadow); min-width: 0; }
+  .card-head { font: 700 10px/1.3 var(--mono); text-transform: uppercase; letter-spacing: .1em;
+    color: var(--muted); margin: 0 0 15px; }
+  .card-head.spaced { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
 
   /* x-ray */
-  .xray { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; align-items: start; }
-  @media (max-width: 1000px) { .xray { grid-template-columns: 1fr; } }
+  .xray { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(400px, .9fr); gap: 24px; align-items: start; }
+  .xray-side { display: grid; gap: 24px; min-width: 0; }
+  .xray-recent { padding: 0; overflow: hidden; }
+  .xray-recent > .card-head { margin: 0; padding: 24px 26px 16px; border-bottom: 1px solid var(--border); }
+  .xray-recent > #frag-recent { padding: 0 26px 18px; }
+  @media (max-width: 1200px) { .xray { grid-template-columns: 1fr; } }
 
   /* context map */
   .ctxmap { font-size: 13px; }
@@ -1082,23 +1132,23 @@ const CSS = `
   .tag-img::before { background: var(--img); }
   .tag-txt { background: var(--txt-tint); color: var(--txt-ink); }
   .tag-txt::before { background: var(--txt); }
-  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
   @media (max-width: 560px) { .split { grid-template-columns: 1fr; } }
-  .split-col { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface); }
+  .split-col { border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; background: var(--surface); }
   .split-img { border-top: 3px solid var(--img); background: linear-gradient(180deg, var(--img-tint), var(--surface) 40%); }
   .split-txt { border-top: 3px solid var(--txt); background: linear-gradient(180deg, var(--txt-tint), var(--surface) 40%); }
   .split-head { font-size: 12px; font-weight: 700; color: var(--ink); margin-bottom: 8px; display: flex;
     flex-direction: column; gap: 2px; }
   .split-sum { font-size: 10.5px; font-weight: 600; color: var(--muted); }
-  .ctx-row { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 4px 0;
+  .ctx-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; padding: 6px 0;
     border-bottom: 1px solid var(--border); }
   .ctx-row:last-of-type { border-bottom: none; }
   .ctx-lbl { color: var(--ink-2); } .ctx-val { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .muted-row { color: var(--muted); font-style: italic; }
   .split-note { font-size: 10.5px; color: var(--muted); margin-top: 7px; }
   .pages-title { font-size: 11px; color: var(--ink-2); margin: 12px 0 6px; }
-  .pages { display: flex; flex-wrap: wrap; gap: 6px; max-height: 320px; overflow: auto;
-    background: var(--surface-2); padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
+  .pages { display: flex; flex-wrap: wrap; gap: 8px; max-height: 320px; overflow: auto;
+    background: var(--surface-2); padding: 8px; border: 1px solid var(--border); border-radius: 8px; }
   .page { height: 130px; width: auto; max-width: 230px; object-fit: contain; object-position: top left;
     image-rendering: pixelated; background: #fff; border: 1px solid var(--border-strong); border-radius: 4px;
     cursor: pointer; transition: border-color .12s, transform .12s; }
@@ -1110,9 +1160,9 @@ const CSS = `
   .row-view { color: var(--flame-ink); font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
   .row-view:hover { text-decoration: underline; }
   table.rtable, table.dtable { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .rtable th, .dtable th { text-align: left; color: var(--muted); font-weight: 600; padding: 7px 8px;
+  .rtable th, .dtable th { position: sticky; top: 0; z-index: 1; text-align: left; color: var(--muted); background: var(--surface); font-weight: 600; padding: 10px 10px;
     border-bottom: 1px solid var(--border-strong); white-space: nowrap; }
-  .rtable td, .dtable td { padding: 7px 8px; border-bottom: 1px solid var(--border);
+  .rtable td, .dtable td { padding: 9px 10px; border-bottom: 1px solid var(--border);
     font-variant-numeric: tabular-nums; vertical-align: middle; color: var(--ink-2); }
   .rtable tr:last-child td, .dtable tr:last-child td { border-bottom: none; }
   .rtable tbody tr:hover, .rtable tbody tr:hover { background: var(--surface-2); }
@@ -1174,12 +1224,14 @@ const CSS = `
   .bar-row { display: flex; align-items: center; gap: 12px; font-size: 12px; }
   .bar-label { width: 150px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: var(--ink); font-family: var(--mono); font-size: 11px; }
-  .bar-track { flex: 1; min-width: 0; height: 16px; background: var(--surface-2); border-radius: 5px;
+  .bar-track { flex: 1; min-width: 0; height: 14px; background: var(--surface-2); border-radius: 4px;
     overflow: hidden; border: 1px solid var(--border); }
   .bar-fill { height: 100%; border-radius: 5px 0 0 5px;
     background: linear-gradient(90deg, #ffa766, var(--flame)); }
   .bar-val { width: 78px; flex: none; text-align: right; font-variant-numeric: tabular-nums;
     color: var(--flame-ink); font-weight: 600; }
+  .bar-val small { display: block; width: 190px; max-width: 28vw; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; color: var(--muted); font-size: 9px; font-weight: 400; }
   .bar-val.neg { color: var(--bad); }
   .axis { margin-top: 12px; color: var(--muted); font-size: 11px; }
   .empty { text-align: center; color: var(--muted); padding: 22px; font-size: 12px; }
@@ -1187,11 +1239,21 @@ const CSS = `
   /* toast tray */
   .tray { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px;
     z-index: 1000; pointer-events: none; }
-  .toast { background: var(--surface); color: var(--bad); border: 1px solid #f0b3ab; border-radius: 9px;
+  .toast { background: var(--surface); color: var(--bad); border: 1px solid #f0b3ab; border-radius: 6px;
     padding: 10px 14px; font-size: 12px; box-shadow: 0 8px 24px rgba(60,35,15,.14); display: flex;
     align-items: center; gap: 12px; pointer-events: auto; max-width: 360px; }
   .toast button { background: transparent; color: inherit; border: 0; cursor: pointer; font-size: 16px;
     line-height: 1; padding: 0; }
+  @media (max-width: 760px) {
+    body { padding-inline: 18px; }
+    .topbar { align-items: flex-start; gap: 18px; }
+    .controls { align-items: flex-start; }
+    .switch { justify-content: flex-start; }
+    .hero { padding: 22px 22px 24px; }
+    .hero-num { display: block; margin: 0 0 8px; }
+    .hero-headline { font-size: 25px; }
+    .card { padding: 18px; }
+  }
 `;
 
 // Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
@@ -1263,7 +1325,7 @@ export function renderPage(port: number): string {
   (function () {
     try {
       var s = localStorage.getItem('pp-theme');
-      var dark = s ? s === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      var dark = s ? s === 'dark' : true;
       document.documentElement.dataset.theme = dark ? 'dark' : 'light';
     } catch (e) { document.documentElement.dataset.theme = 'light'; }
   })();
@@ -1275,6 +1337,7 @@ export function renderPage(port: number): string {
   <div class="brand">
     <span class="flame-dot"></span>
     <div>
+      <div class="wordmark-kicker">Live context ledger</div>
       <div class="wordmark">pxpipe</div>
       <div class="tagline">See exactly what became images, what stayed text, and how each provider billed it.</div>
     </div>
@@ -1297,22 +1360,26 @@ export function renderPage(port: number): string {
 <section class="section">
   <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>
   <div class="xray">
-    <div class="card">
+    <div class="card xray-recent">
       <h3 class="card-head">Recent requests</h3>
       <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
     </div>
-    <div class="card">
-      <h3 class="card-head">Image vs text breakdown</h3>
-      <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
-      <h3 class="card-head spaced">Image ↔ source inspector</h3>
-      <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
-           hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
+    <div class="xray-side">
+      <div class="card">
+        <h3 class="card-head">Image vs text breakdown</h3>
+        <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
+      </div>
+      <div class="card">
+        <h3 class="card-head">Image ↔ source inspector</h3>
+        <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
+             hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
+      </div>
     </div>
   </div>
 </section>
 
 <section class="section">
-  <h2 class="section-head">Top sessions <span class="section-sub">by tokens saved</span></h2>
+  <h2 class="section-head">Top sessions <span class="section-sub">by provider input-credit equivalents saved · not a cross-provider dollar total</span></h2>
   <div class="card">
     <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>

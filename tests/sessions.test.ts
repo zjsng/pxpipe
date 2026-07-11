@@ -202,6 +202,49 @@ describe('aggregateSessions', () => {
     // Warm text/image delta is discounted at the same 0.1x read rate.
     expect(s.tokensSavedEst).toBe(400);
     expect(s.cacheReadTokens).toBe(8_000);
+    expect(s.providerStats.openai?.models).toEqual(['gpt-5.6-terra']);
+    expect(s.providerStats.openai?.serviceTiers).toEqual(['terra']);
+    expect(s.providerStats.openai?.ordinaryInputTokens).toBe(1_000);
+    expect(s.providerStats.openai?.actualInputWeighted).toBe(3_050);
+    expect(s.providerStats.openai?.baselineInputWeighted).toBe(3_450);
+    expect(s.providerStats.openai?.savedInputWeighted).toBe(400);
+  });
+
+  it('does not turn passthrough, refusal, or error rows into session savings', async () => {
+    writeEvents(tmp, [
+      ev({
+        first_user_sha8: 'honest',
+        compressed: false,
+        baseline_probe_status: 'ok',
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 20_000,
+        input_tokens: 100,
+        cache_read_tokens: 20_000,
+      }),
+      ev({
+        first_user_sha8: 'honest',
+        compressed: true,
+        safety_flagged: true,
+        stop_reason: 'refusal',
+        baseline_probe_status: 'ok',
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 20_000,
+        input_tokens: 100,
+        cache_read_tokens: 20_000,
+      }),
+      ev({
+        first_user_sha8: 'honest',
+        status: 502,
+        compressed: true,
+        baseline_probe_status: 'ok',
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 20_000,
+        input_tokens: 100,
+        cache_read_tokens: 20_000,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    expect(sessions.get('honest')?.tokensSavedEst).toBe(0);
   });
 
   it('reports a real NEGATIVE when cache_create overhead exceeds the prefix saving; probe-miss credits 0', async () => {

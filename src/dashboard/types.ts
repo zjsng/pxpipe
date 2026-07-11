@@ -2,6 +2,9 @@
 
 /** /proxy-stats payload. */
 export interface StatsPayload {
+  /** All top-level weighted totals are provider-credit equivalents; use the
+   * provider buckets for rates and never treat a mixed total as USD. */
+  accounting_basis?: string;
   port: number;
   uptime_sec: number;
   requests: number;
@@ -31,7 +34,8 @@ export interface StatsPayload {
   compressed_minus_passthrough_avg_usd: number;
   split_sufficient_sample: boolean;
   split_min_sample_per_bucket: number;
-  saved_usd: number;
+  /** Claude-only conversion; null when the observed traffic has no priced Claude bucket. */
+  saved_usd: number | null;
   output_weighted: number;
   baseline_token_equivalent: number;
   actual_token_equivalent: number;
@@ -77,6 +81,7 @@ export interface DashboardProviderStats {
   compressed_avg_input_weighted: number;
   passthrough_avg_input_weighted: number;
   input_tokens: number;
+  ordinary_input_tokens: number;
   output_tokens: number;
   reasoning_tokens: number;
   anthropic_cache_create_tokens: number;
@@ -130,6 +135,9 @@ export interface RecentRow {
   status: number;
   size_in?: number;
   compressed: boolean;
+  reason?: string;
+  error?: string;
+  error_body?: string;
   /** Provider classification; accounting must never infer this from a UI label. */
   provider?: 'anthropic' | 'openai' | 'other';
   service_tier?: string;
@@ -190,9 +198,37 @@ export interface SessionRow {
   models?: string[];
   providers?: string[];
   serviceTiers?: string[];
+  providerStats?: Record<string, SessionProviderSummary>;
   jsonlBytes: number;
   sidecarBytes: number;
   claudeCode: ClaudeCodeRef | null;
+}
+
+export interface SessionProviderSummary {
+  provider: 'anthropic' | 'openai' | 'other';
+  requests: number;
+  compressedRequests: number;
+  usageRequests: number;
+  inputTokens: number;
+  ordinaryInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  baselineMeasuredCount: number;
+  /** Measured compressed rows only; same basis as savedInputWeighted. */
+  baselineInputWeighted: number;
+  /** Measured compressed rows only; same basis as baselineInputWeighted. */
+  actualInputWeighted: number;
+  /** All successful usage-bearing rows, including passthrough/unmeasured rows. */
+  allBaselineEquivalentWeighted?: number;
+  allActualInputWeighted?: number;
+  allOutputWeighted?: number;
+  savedInputWeighted: number;
+  models: string[];
+  serviceTiers: string[];
 }
 
 export interface ClaudeCodeRef {
@@ -227,7 +263,16 @@ export interface FullStatsSummary {
   outputTokensTotal: number;
   reasoningTokensTotal?: number;
   cacheHitEvents: number;
-  eventsWithBaseline: number;
+  /** Legacy alias may be absent; use eventsWithUsage for cache telemetry. */
+  eventsWithBaseline?: number;
+  eventsWithUsage?: number;
+  baselineMeasuredCount?: number;
+  baselineInputWeighted?: number;
+  actualInputWeighted?: number;
+  savedInputWeighted?: number;
+  allBaselineEquivalentWeighted?: number;
+  allActualInputWeighted?: number;
+  allOutputWeighted?: number;
   origCharsTotal: number;
   imageBytesTotal: number;
   durationP50: number;
@@ -271,6 +316,13 @@ export interface ProviderStatsPayload {
   renderCacheMisses?: number;
   renderCacheSavedMs?: number;
   promptCacheKeyEvents?: number;
+  baselineMeasuredCount?: number;
+  baselineInputWeighted?: number;
+  actualInputWeighted?: number;
+  savedInputWeighted?: number;
+  allBaselineEquivalentWeighted?: number;
+  allActualInputWeighted?: number;
+  allOutputWeighted?: number;
 }
 
 /** POST /api/compression response. */
@@ -305,14 +357,21 @@ export interface CurrentSessionProviderPayload {
   compressedRequests: number;
   usageRequests: number;
   baselineMeasuredCount: number;
+  /** Measured compressed rows only; same basis as savedInputWeighted. */
   baselineInputWeighted: number;
+  /** Measured compressed rows only; same basis as baselineInputWeighted. */
   actualInputWeighted: number;
+  /** All successful usage-bearing rows, including passthrough/unmeasured rows. */
+  allBaselineEquivalentWeighted?: number;
+  allActualInputWeighted?: number;
+  allOutputWeighted?: number;
   outputWeighted: number;
   savedInputWeighted: number;
   rawActualTokens: number;
   rawBaselineTokens: number;
   rawOutputTokens: number;
   inputTokens: number;
+  ordinaryInputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
   cacheReadTokens: number;

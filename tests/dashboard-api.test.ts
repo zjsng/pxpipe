@@ -11,6 +11,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { DashboardState, dashboardPath } from '../src/dashboard.js';
+import { serviceTierFor } from '../src/core/provider.js';
+import { renderStatsTableFragment } from '../src/dashboard/fragments.js';
 import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
@@ -86,6 +88,41 @@ describe('dashboardPath()', () => {
     // The per-session detail routes were cut — these no longer match.
     expect(dashboardPath('/api/sessions/abc12345.json')).toBeNull();
     expect(dashboardPath('/sessions/abc12345')).toBeNull();
+  });
+});
+
+describe('provider-aware tier display', () => {
+  it('keeps the resolved GPT variant visible when Codex reports a generic default tier', () => {
+    expect(serviceTierFor('gpt-5.6-sol', 'default')).toBe('sol');
+    expect(serviceTierFor('gpt-5.6-terra', 'default')).toBe('terra');
+    expect(serviceTierFor('gpt-5.6-luna', 'default')).toBe('luna');
+    expect(serviceTierFor('gpt-5.6-sol[1m]', 'default')).toBe('sol');
+    expect(serviceTierFor('gpt-5.6', 'default')).toBe('default');
+  });
+});
+
+describe('recent request hygiene', () => {
+  it('filters successful model discovery but keeps discovery errors visible', async () => {
+    dash.update({
+      method: 'GET',
+      path: '/models',
+      status: 200,
+      durationMs: 4,
+    } as never);
+    dash.update({
+      method: 'GET',
+      path: '/models',
+      status: 401,
+      durationMs: 5,
+      error: 'upstream_authentication_error',
+      errorBody: '{"error":"bad token"}',
+    } as never);
+    const payload = (await dash.serveRecent().json()) as RecentPayload;
+    expect(payload.recent).toHaveLength(1);
+    expect(payload.recent[0]).toMatchObject({ path: '/models', status: 401 });
+    const html = await (await dash.serveFragment('recent', new URL('http://localhost/fragments/recent'), 1)).text();
+    expect(html).toContain('upstream_authentication_error');
+    expect(html).toContain('upstream: {&quot;error&quot;:&quot;bad token&quot;}');
   });
 });
 
@@ -292,6 +329,64 @@ describe('serveFragment', () => {
     expect(recent).toContain('gpt-5.6-luna');
   });
 
+  it('replays Sol/Terra/Luna tiers consistently into current session, history, and sessions', async () => {
+    writeEvents(tmp, ['sol', 'terra', 'luna'].map((tier) => ev({
+      path: '/responses',
+      model: `gpt-5.6-${tier}`,
+      compressed: true,
+      first_user_sha8: 'all-tiers',
+      input_tokens: 10_000,
+      cached_tokens: 2_000,
+      image_tokens: 1_000,
+      baseline_imaged_tokens: 5_000,
+      image_count: 1,
+    })));
+    await dash.replay(tmp.eventsFile);
+    const current = (await dash.serveCurrentSessionJson().json()) as any;
+    expect(current.providers.openai.serviceTiers).toEqual([
+      ['sol', 1], ['terra', 1], ['luna', 1],
+    ]);
+    const sessions = await (await dash.serveSessionsJson()).json() as any;
+    expect(sessions.sessions[0].providerStats.openai.serviceTiers).toEqual(['sol', 'terra', 'luna']);
+    const full = await (await dash.serveApiStats()).json() as any;
+    expect(full.summary.byProvider.openai.serviceTiers).toEqual([
+      ['sol', 1], ['terra', 1], ['luna', 1],
+    ]);
+    const recent = await (await dash.serveFragment('recent', url, 1)).text();
+    expect(recent.match(/tier (?:sol|terra|luna)/g)?.sort()).toEqual(['tier luna', 'tier sol', 'tier terra']);
+  });
+
+  it('keeps full-history Claude cache labels and GPT credits in separate rows', async () => {
+    writeEvents(tmp, [
+      ev({
+        path: '/v1/messages',
+        model: 'claude-fable-5',
+        compressed: true,
+        baseline_probe_status: 'ok',
+        baseline_tokens: 20_000,
+        baseline_cacheable_tokens: 18_000,
+        input_tokens: 100,
+        cache_read_tokens: 18_000,
+      }),
+      ev({
+        path: '/responses',
+        model: 'gpt-5.6-luna',
+        compressed: true,
+        input_tokens: 10_000,
+        output_tokens: 100,
+        cached_tokens: 8_000,
+        image_tokens: 1_000,
+        baseline_imaged_tokens: 5_000,
+      }),
+    ]);
+    const payload = await (await dash.serveApiStats()).json();
+    const html = renderStatsTableFragment(payload as never);
+    expect(html).toContain('Claude / Anthropic');
+    expect(html).toContain('GPT / OpenAI');
+    expect(html).toContain('GPT credits');
+    expect(html).not.toContain('Claude cache hit (by tokens)');
+  });
+
   it('escapes HTML in latest source text', async () => {
     dash.captureImage({
       imagePngs: [new Uint8Array([137, 80, 78, 71])],
@@ -426,6 +521,48 @@ describe('GPT savings split', () => {
     expect(stats.saved_input_tokens).toBe(0);
     const recent = (await dash.serveRecent().json()) as RecentPayload;
     expect(recent.recent.at(-1)!.session_saved_so_far_delta ?? 0).toBe(0);
+  });
+
+  it('keeps GPT ordinary input, cached reads, cache writes, and image savings on one basis', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/responses',
+      model: 'gpt-5.6-sol',
+      status: 200,
+      durationMs: 100,
+      usage: {
+        input_tokens: 10_000,
+        output_tokens: 100,
+        cached_tokens: 2_000,
+        cache_write_tokens: 1_000,
+        reasoning_tokens: 40,
+      },
+      info: {
+        compressed: true,
+        imageTokens: 1_000,
+        baselineImagedTokens: 5_000,
+        imageCount: 1,
+        firstUserSha8: 'gptwrite',
+      },
+    } as never);
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    const row = ((await dash.serveRecent().json()) as RecentPayload).recent.at(-1)!;
+    // ordinary=7000, cached=2000×.1, write=1000×1.25 => actual 8450;
+    // text/image delta=(5000−1000)×.1 => baseline 8850; saved=400.
+    expect(row.ordinary_input_tokens).toBe(7_000);
+    expect(row.cache_read).toBe(2_000);
+    expect(row.cache_write).toBe(1_000);
+    expect(row.actual_input).toBe(8_450);
+    expect(row.baseline_input).toBe(8_850);
+    expect(row.session_saved_so_far_delta).toBe(400);
+    expect(stats.providers?.openai?.openai_cache_write_tokens).toBe(1_000);
+    expect(stats.providers?.openai?.ordinary_input_tokens).toBe(7_000);
+    expect(stats.providers?.openai?.output_tokens).toBe(100);
+    expect(stats.saved_usd).toBeNull();
+    const current = (await dash.serveCurrentSessionJson().json()) as any;
+    expect(current.providers.openai.actualInputWeighted).toBe(8_450);
+    expect(current.providers.openai.baselineInputWeighted).toBe(8_850);
+    expect(current.providers.openai.allActualInputWeighted).toBe(8_450);
   });
 
   it('replay() reconstructs GPT recent rows byte-identically to the live path', async () => {

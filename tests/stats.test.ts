@@ -86,12 +86,24 @@ describe('stats aggregator', () => {
 
   it('aggregates OpenAI cached reads and GPT-5.6 cache writes separately', () => {
     const s = newSummary();
-    fold(s, ev({ input_tokens: 10_000, cached_tokens: 8_000, cache_write_tokens: 1_000 }));
+    fold(s, ev({
+      path: '/responses',
+      model: 'gpt-5.6-luna',
+      compressed: true,
+      input_tokens: 10_000,
+      output_tokens: 100,
+      cached_tokens: 8_000,
+      cache_write_tokens: 1_000,
+      image_tokens: 1_000,
+      baseline_imaged_tokens: 5_000,
+    }));
     expect(s.openAICachedTokensTotal).toBe(8_000);
     expect(s.openAICacheWriteTokensTotal).toBe(1_000);
+    expect(s.byProvider.get('openai')?.savedInputWeighted).toBe(400);
     const json = summaryToJson(s);
     expect(json.openAICachedTokensTotal).toBe(8_000);
     expect(json.openAICacheWriteTokensTotal).toBe(1_000);
+    expect((json.byProvider as Record<string, { savedInputWeighted: number }>).openai.savedInputWeighted).toBe(400);
   });
 
   it('buckets by cwd and tracks system_sha8 reuse', () => {

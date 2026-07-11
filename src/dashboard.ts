@@ -32,17 +32,7 @@ import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
-import {
-  computeActualInputEff,
-  computeBaselineInputEff,
-  deriveBaselineWarmth,
-} from './core/baseline.js';
-import {
-  computeOpenAIActualInputEff,
-  computeOpenAIBaselineInputEff,
-  computeOpenAIBaselineRawTokens,
-  openAIOutputRate,
-} from './core/openai-savings.js';
+import { accountUsage, isSafetyStopReason } from './core/accounting.js';
 import {
   aggregateSessions,
   claudeCodeMap,
@@ -132,6 +122,11 @@ export interface RecentRow {
   status: number;
   size_in?: number;
   compressed: boolean;
+  /** Why the request stayed passthrough (unsupported model, kill switch,
+   * below-threshold gate, etc.). */
+  reason?: string;
+  error?: string;
+  error_body?: string;
   provider?: ProviderId;
   service_tier?: string;
   stop_reason?: string;
@@ -261,14 +256,21 @@ interface SessionProviderTotals {
   compressedRequests: number;
   usageRequests: number;
   baselineMeasuredCount: number;
+  /** Measured compressed rows only; same basis as savedInputWeighted. */
   baselineInputWeighted: number;
+  /** Measured compressed rows only; same basis as baselineInputWeighted. */
   actualInputWeighted: number;
+  /** All successful usage-bearing rows, including passthrough/unmeasured rows. */
+  allBaselineEquivalentWeighted: number;
+  allActualInputWeighted: number;
+  allOutputWeighted: number;
   outputWeighted: number;
   savedInputWeighted: number;
   rawActualTokens: number;
   rawBaselineTokens: number;
   rawOutputTokens: number;
   inputTokens: number;
+  ordinaryInputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
   cacheReadTokens: number;
@@ -383,6 +385,7 @@ interface ProviderTotals {
   passthroughActualInputWeighted: number;
   passthroughOutputWeighted: number;
   inputTokens: number;
+  ordinaryInputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
   anthropicCacheCreateTokens: number;
@@ -472,6 +475,7 @@ function newProviderTotals(provider: ProviderId): ProviderTotals {
     passthroughActualInputWeighted: 0,
     passthroughOutputWeighted: 0,
     inputTokens: 0,
+    ordinaryInputTokens: 0,
     outputTokens: 0,
     reasoningTokens: 0,
     anthropicCacheCreateTokens: 0,
@@ -496,13 +500,7 @@ function newProviderTotals(provider: ProviderId): ProviderTotals {
   };
 }
 
-function safetyStop(reason: string | undefined): boolean {
-  return reason === 'refusal'
-    || reason === 'content_filter'
-    || reason === 'safety'
-    || reason === 'safety_refusal'
-    || reason === 'blocked';
-}
+const safetyStop = isSafetyStopReason;
 
 function isSuccessfulModelDiscovery(path: string, status: number): boolean {
   if (status >= 400) return false;
@@ -536,12 +534,16 @@ function newSessionProviderTotals(provider: ProviderId): SessionProviderTotals {
     baselineMeasuredCount: 0,
     baselineInputWeighted: 0,
     actualInputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
+    allActualInputWeighted: 0,
+    allOutputWeighted: 0,
     outputWeighted: 0,
     savedInputWeighted: 0,
     rawActualTokens: 0,
     rawBaselineTokens: 0,
     rawOutputTokens: 0,
     inputTokens: 0,
+    ordinaryInputTokens: 0,
     outputTokens: 0,
     reasoningTokens: 0,
     cacheReadTokens: 0,
@@ -556,73 +558,6 @@ function newSessionProviderTotals(provider: ProviderId): SessionProviderTotals {
     renderCacheMisses: 0,
     renderCacheSavedMs: 0,
     promptCacheKeyEvents: 0,
-  };
-}
-
-/** Route per-event accounting by upstream. OpenAI paths use the GPT cost
- *  model (vision-token imaging, automatic 0.1× prefix cache, no count_tokens
- *  probe, 8× output); everything else uses the Anthropic cache-aware baseline.
- *  Anthropic paths are `/v1/messages[/count_tokens]`; neither word appears. */
-function isOpenAIEvent(path: string | undefined): boolean {
-  if (!path) return false;
-  return path.includes('responses') || path.includes('chat/completions');
-}
-
-/** Cache-aware eff bundle for one GPT event. Shared by the live `update()`
- *  and `replay()` paths so both read identical per-row numbers. Pure: takes
- *  plain scalars (replay has no Usage/TransformInfo objects, only JSONL fields).
- *
- *  GPT differs from Anthropic on every axis: input_tokens already INCLUDES the
- *  cached subset (`cachedTokens`), GPT-5.6 cache writes carry a premium, the cached
- *  prefix reads at ~0.1×, and the baseline is the measured `baselineImagedTokens`
- *  (o200k text-token cost of the imaged content) vs the vision-token `imageTokens`
- *  pxpipe actually paid — not a count_tokens probe. No per-session warmth state:
- *  OpenAI caching is automatic/prefix-based and the discount is already folded
- *  into the cached-input rate. See src/core/openai-savings.ts. */
-function gptEff(args: {
-  model: string | undefined;
-  inputTokens: number;
-  outputTokens: number;
-  cachedTokens: number;
-  cacheWriteTokens: number;
-  imageTokens: number;
-  baselineImagedTokens: number;
-  compressed: boolean;
-}): {
-  haveUsage: boolean;
-  haveBaseline: boolean;
-  creditSaving: boolean;
-  actualInputEff: number;
-  baselineInputEff: number;
-  outputEquiv: number;
-  rawActual: number;
-  rawBaseline: number;
-} {
-  const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached, cacheWriteTokens: written } = args;
-  const { imageTokens, baselineImagedTokens, compressed } = args;
-  const haveUsage = inp > 0 || out > 0 || cached > 0 || written > 0;
-  // The transform measured what the imaged content would have cost as o200k
-  // text; without it there is no counterfactual to credit.
-  const haveBaseline = baselineImagedTokens > 0;
-  const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model, written) : 0;
-  const creditSaving = haveBaseline && haveUsage && compressed;
-  const baselineInputEff = creditSaving
-    ? computeOpenAIBaselineInputEff(inp, cached, imageTokens, baselineImagedTokens, model, written)
-    : actualInputEff;
-  const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
-  // Raw, rate-free token counts for the session's compression ratio and the
-  // Details panel: actual = what we sent; baseline = the text-only equivalent.
-  const rawActual = inp;
-  const rawBaseline = computeOpenAIBaselineRawTokens(inp, imageTokens, baselineImagedTokens);
-  return {
-    haveUsage,
-    haveBaseline,
-    creditSaving,
-    actualInputEff,
-    baselineInputEff,
-    outputEquiv,
-    rawActual,
-    rawBaseline,
   };
 }
 
@@ -796,146 +731,56 @@ export class DashboardState {
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
-    const gpt = provider === 'openai';
     const safety = safetyStop(ev.stopReason);
 
-    // Unified per-row accounting, filled by the provider branch below. The
-    // downstream totals / per-session / recent-row code reads only these —
-    // it never re-derives cache math, so Anthropic and GPT can't drift.
-    let haveUsage: boolean;
-    let haveBaseline: boolean;
-    let creditSaving: boolean;
-    let actualInputEff: number;
-    let baselineInputEff: number;
-    let outputEquiv: number;
-    let rawActual: number; // raw tokens sent (session ratio + Details realInput)
-    let rawBaseline: number; // raw text-only counterfactual tokens
-    let baselineForRow: number; // baseline token count for contextHistory/recent
-    let cacheReadForRow: number; // tokens to surface in the "Cache hits" column
-    let warmForRow: boolean; // did the TEXT baseline read warm? Server-observed:
-    // Anthropic cr>0 or GPT cached_tokens>0. Drives Context Map narration.
-
-    if (gpt) {
-      // GPT cost model: no count_tokens probe, no cache-create premium, no
-      // per-session warmth — the discount is automatic and folded into the
-      // cached-input rate. Baseline is the measured imaged-vs-text delta.
-      const e = gptEff({
+    // One shared accounting function feeds live updates, replay, sessions, and
+    // full-history stats. In particular, a passthrough/error row cannot become
+    // a fake savings win merely because it carried a baseline field.
+    const completionSec = Date.now() / 1000;
+    const acc = accountUsage(
+      {
+        provider,
         model: ev.model,
+        status: ev.status,
+        compressed,
+        safetyFlagged: safety,
         inputTokens: inp,
         outputTokens: out,
-        cachedTokens: u?.cached_tokens ?? 0,
-        cacheWriteTokens: u?.cache_write_tokens ?? 0,
-        imageTokens: info?.imageTokens ?? 0,
-        baselineImagedTokens: info?.baselineImagedTokens ?? 0,
-        compressed,
-      });
-      haveUsage = e.haveUsage;
-      haveBaseline = e.haveBaseline;
-      creditSaving = e.creditSaving && !safety;
-      actualInputEff = e.actualInputEff;
-      baselineInputEff = creditSaving ? e.baselineInputEff : actualInputEff;
-      outputEquiv = e.outputEquiv;
-      rawActual = e.rawActual;
-      rawBaseline = e.rawBaseline;
-      baselineForRow = e.rawBaseline;
-      cacheReadForRow = u?.cached_tokens ?? 0;
-      // GPT's prefix discount is automatic: cached_tokens>0 ⇒ it read warm.
-      warmForRow = (u?.cached_tokens ?? 0) > 0;
-    } else {
-      haveUsage = u !== undefined && (inp > 0 || out > 0 || cc > 0 || cr > 0);
-      const baseline = info?.baselineTokens;
-
-      // Honest gating: only attribute savings when BOTH baseline probes
-      // resolved (status === 'ok'). When the cacheable-prefix probe failed
-      // (status === 'partial') we previously fell through to cacheable=0,
-      // which silently charges the unproxied counterfactual the cold-input
-      // rate on tokens that actually would have been cache-discounted —
-      // fabricating "$ saved". Excluding the row is the only honest move
-      // until the probe succeeds.
-      const probeOk = info?.baselineProbeStatus === 'ok'
-        // Back-compat: hosts that haven't adopted baselineProbeStatus yet
-        // still see fields land; we accept legacy rows where the full-body
-        // probe resolved AND (either no markers existed OR cacheable did too).
-        || (info?.baselineProbeStatus === undefined && baseline !== undefined && baseline > 0);
-      haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-
-      // Weighted INPUT cost we actually paid this turn.
-      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
-
-      // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
-      // row had its body forwarded untouched, so its unproxied counterfactual
-      // IS exactly what it paid — crediting the cache-modeled baseline there
-      // (which prices the prefix at the cache-READ rate) fabricates savings on
-      // passthrough traffic. Only credit the counterfactual when the row was
-      // actually compressed AND we have a usable probe.
-      creditSaving = haveBaseline && haveUsage && compressed && !safety;
-
-      // Cache-aware, server-observed baseline. INVARIANT: pxpipe is credited ONLY
-      // for the text it imaged away — NEVER for caching. The imagined text path
-      // gets the same observed cache state as the actual request: cr>0 means warm
-      // for both, cr===0 means cold for both. No wall-clock-only inference.
-      // Uncompressed rows fall back to actualInputEff → zero savings.
-      const cacheable = info?.baselineCacheableTokens ?? 0;
-      // If cr>0 proved warmth, a completed prior with the same prefix refines the
-      // reused/grown split for the text baseline. Use request start for that
-      // lookup; an overlapping request that had not completed could not provide a
-      // prior prefix size for this in-flight request.
-      const sidNow = info?.firstUserSha8;
-      const prefixShaNow = info?.systemSha8;
-      const completionSec = Date.now() / 1000;
-      const requestStartSec = completionSec - Math.max(0, ev.durationMs || 0) / 1000;
-      const warmthPrev =
-        typeof sidNow === 'string' && sidNow.length > 0
-          ? this.baselineWarmth.get(sidNow)
-          : undefined;
-      // Warmth itself is cr-only; prior state only estimates the warm split.
-      // Centralised in deriveBaselineWarmth so update()/replay()/sessions can't drift.
-      const { warm, prevCacheable } = deriveBaselineWarmth(
-        warmthPrev,
-        requestStartSec,
-        cacheable,
-        cr,
-        DashboardState.CACHE_TTL_SEC,
-        prefixShaNow,
-      );
-      baselineInputEff = creditSaving
-        ? computeBaselineInputEff(
-            baseline as number,
-            cacheable,
-            inp,
-            cc,
-            cr,
-            warm,
-            prevCacheable,
-          )
-        : actualInputEff;
-      // Record this completed turn's prefix size for future cr>0 split estimates.
-      // Carry the prior cacheable when this row has no probe.
-      if (typeof sidNow === 'string' && sidNow.length > 0 && haveUsage) {
-        this.baselineWarmth.set(sidNow, {
-          ts: completionSec,
-          cacheable: cacheable > 0 ? cacheable : (warmthPrev?.cacheable ?? 0),
-          prefixSha: prefixShaNow ?? warmthPrev?.prefixSha,
-        });
-        if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
-          const firstKey = this.baselineWarmth.keys().next().value;
-          if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
-        }
-      }
-
-      // Output tokens are identical with/without compression — the proxy never
-      // touches the response body. They show up on BOTH sides of the savings
-      // ratio at their actual rate (OUTPUT_TOKEN_RATE × input rate) so the
-      // denominator reflects the full bill the user actually pays. Without
-      // this, an output-heavy turn would silently inflate the "saved %"
-      // headline relative to what Anthropic's weekly limit meters as token
-      // consumption (input + output × 5).
-      outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
-      rawActual = inp + cc + cr;
-      rawBaseline = baseline ?? 0;
-      baselineForRow = baseline ?? 0;
-      cacheReadForRow = cr;
-      warmForRow = warm; // server-observed cache read (cr>0)
+        reasoningTokens: u?.reasoning_tokens,
+        cacheCreateTokens: cc,
+        cacheReadTokens: cr,
+        cachedTokens: u?.cached_tokens,
+        cacheWriteTokens: u?.cache_write_tokens,
+        imageTokens: info?.imageTokens,
+        baselineImagedTokens: info?.baselineImagedTokens,
+        baselineTokens: info?.baselineTokens,
+        baselineCacheableTokens: info?.baselineCacheableTokens,
+        baselineProbeStatus: info?.baselineProbeStatus,
+        sessionId: info?.firstUserSha8,
+        completionSec,
+        requestStartSec: completionSec - Math.max(0, ev.durationMs || 0) / 1000,
+        prefixSha: info?.systemSha8,
+      },
+      { warmth: this.baselineWarmth, cacheTtlSec: DashboardState.CACHE_TTL_SEC },
+    );
+    const {
+      haveUsage,
+      haveBaseline,
+      creditSaving,
+      actualInputEff,
+      baselineInputEff,
+      outputEquiv,
+      rawActualTokens: rawActual,
+      rawBaselineTokens: rawBaseline,
+      cacheReadTokens: cacheReadForRow,
+      cacheWriteTokens: cacheWriteForRow,
+      warm: warmForRow,
+      ordinaryInputTokens,
+    } = acc;
+    const baselineForRow = rawBaseline;
+    if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
+      const firstKey = this.baselineWarmth.keys().next().value;
+      if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
     }
 
     // Record the request's transform breakdown for the Context Map panel. This
@@ -953,7 +798,7 @@ export class DashboardState {
         realInput: rawActual,
         baselineInputEff,
         actualInputEff,
-        haveBaseline: haveBaseline && !safety,
+        haveBaseline: creditSaving,
         cacheRead: cacheReadForRow,
         warm: warmForRow,
         output: out,
@@ -995,7 +840,7 @@ export class DashboardState {
     // can't measure the counterfactual, so actual ≈ baseline). This
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
-    if (haveUsage) {
+    if (acc.billableUsage) {
       // baselineInputEff already folds the uncompressed/probe-failed fallback
       // to actualInputEff, so passthrough rows contribute zero saved here.
       this.totals.allBaselineEquivalentWeighted += baselineInputEff;
@@ -1071,7 +916,7 @@ export class DashboardState {
       // above (allActualInputWeighted / allOutputWeighted). Used as the
       // honest denominator for the session's saved-% so caching wins on
       // unmeasured requests still count toward "what you actually paid".
-      if (haveUsage) {
+      if (acc.billableUsage) {
         s.allActualInputWeighted += actualInputEff;
         s.allOutputWeighted += outputEquiv;
       }
@@ -1082,15 +927,17 @@ export class DashboardState {
       }
       sp.requests += 1;
       if (compressed) sp.compressedRequests += 1;
-      if (haveUsage) {
+      if (acc.billableUsage) {
         sp.usageRequests += 1;
         sp.inputTokens += inp;
+        sp.ordinaryInputTokens += ordinaryInputTokens;
         sp.outputTokens += out;
         sp.reasoningTokens += u?.reasoning_tokens ?? 0;
-        sp.actualInputWeighted += actualInputEff;
-        sp.outputWeighted += outputEquiv;
-        sp.cacheReadTokens += provider === 'openai' ? (u?.cached_tokens ?? 0) : cr;
-        sp.cacheWriteTokens += provider === 'openai' ? (u?.cache_write_tokens ?? 0) : cc;
+        sp.allBaselineEquivalentWeighted += baselineInputEff;
+        sp.allActualInputWeighted += actualInputEff;
+        sp.allOutputWeighted += outputEquiv;
+        sp.cacheReadTokens += provider === 'openai' ? cacheReadForRow : cr;
+        sp.cacheWriteTokens += provider === 'openai' ? cacheWriteForRow : cc;
       }
       sp.imageTokens += info?.imageTokens ?? 0;
       sp.baselineImagedTokens += info?.baselineImagedTokens ?? 0;
@@ -1105,6 +952,8 @@ export class DashboardState {
       if (creditSaving) {
         sp.baselineMeasuredCount += 1;
         sp.baselineInputWeighted += baselineInputEff;
+        sp.actualInputWeighted += actualInputEff;
+        sp.outputWeighted += outputEquiv;
         sp.savedInputWeighted += baselineInputEff - actualInputEff;
         sp.rawActualTokens += rawActual;
         sp.rawBaselineTokens += rawBaseline;
@@ -1131,9 +980,10 @@ export class DashboardState {
     const pt = providerTotalsFor(this.totals.providerTotals, provider);
     pt.requests += 1;
     if (compressed) pt.compressedRequests += 1;
-    if (haveUsage) {
+    if (acc.billableUsage) {
       pt.usageRequests += 1;
       pt.inputTokens += inp;
+      pt.ordinaryInputTokens += ordinaryInputTokens;
       pt.outputTokens += out;
       pt.reasoningTokens += u?.reasoning_tokens ?? 0;
       pt.allActualInputWeighted += actualInputEff;
@@ -1150,8 +1000,8 @@ export class DashboardState {
       }
     }
     if (provider === 'openai') {
-      pt.openAICachedTokens += u?.cached_tokens ?? 0;
-      pt.openAICacheWriteTokens += u?.cache_write_tokens ?? 0;
+      pt.openAICachedTokens += cacheReadForRow;
+      pt.openAICacheWriteTokens += cacheWriteForRow;
     } else if (provider === 'anthropic') {
       pt.anthropicCacheCreateTokens += cc;
       pt.anthropicCacheReadTokens += cr;
@@ -1186,6 +1036,9 @@ export class DashboardState {
       model: ev.model,
       status: ev.status,
       compressed,
+      reason: info?.reason,
+      error: ev.error,
+      error_body: ev.errorBody,
       provider,
       service_tier: tier,
       stop_reason: ev.stopReason,
@@ -1196,12 +1049,12 @@ export class DashboardState {
       output_tokens: haveUsage ? out : undefined,
       reasoning_tokens: haveUsage ? u?.reasoning_tokens : undefined,
       cache_create: haveUsage ? cc : undefined,
-      cache_read: haveUsage ? (provider === 'openai' ? u?.cached_tokens : cr) : undefined,
-      cache_write: provider === 'openai' && haveUsage ? u?.cache_write_tokens : undefined,
-      cached_tokens: provider === 'openai' && haveUsage ? u?.cached_tokens : undefined,
+      cache_read: haveUsage ? (provider === 'openai' ? cacheReadForRow : cr) : undefined,
+      cache_write: provider === 'openai' && haveUsage ? cacheWriteForRow : undefined,
+      cached_tokens: provider === 'openai' && haveUsage ? cacheReadForRow : undefined,
       ordinary_input_tokens: provider === 'openai' && haveUsage
         && (u?.cached_tokens !== undefined || u?.cache_write_tokens !== undefined)
-        ? Math.max(0, inp - (u?.cached_tokens ?? 0) - (u?.cache_write_tokens ?? 0))
+        ? ordinaryInputTokens
         : undefined,
       image_tokens: provider === 'openai' ? info?.imageTokens : undefined,
       baseline_imaged_tokens: provider === 'openai' ? info?.baselineImagedTokens : undefined,
@@ -1267,108 +1120,54 @@ export class DashboardState {
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
       const provider = providerForPath(t.path, t.model);
+      const gpt = provider === 'openai';
       const tier = serviceTierFor(t.model, t.service_tier);
       const safety = t.safety_flagged === true || safetyStop(t.stop_reason);
-      const gpt = provider === 'openai';
-
-      // Same unified accounting as update(); see the branch comments there.
-      let haveUsage: boolean;
-      let haveBaseline: boolean;
-      let creditSaving: boolean;
-      let actualInputEff: number;
-      let baselineInputEff: number;
-      let outputEquiv: number;
-      let rawActual: number;
-      let rawBaseline: number;
-      let baselineForRow: number;
-      let cacheReadForRow: number;
-      let warmForRow: boolean; // text-baseline warmth for the Context Map narration
-
-      if (gpt) {
-        const e = gptEff({
+      const completionSec = Date.parse(t.ts) / 1000;
+      const acc = accountUsage(
+        {
+          provider,
           model: t.model,
+          status: t.status,
+          compressed,
+          safetyFlagged: safety,
           inputTokens: inp,
           outputTokens: out,
-          cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
-          cacheWriteTokens: t.cache_write_tokens ?? 0,
-          imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
-          baselineImagedTokens:
-            (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
-          compressed,
-        });
-        haveUsage = e.haveUsage;
-        haveBaseline = e.haveBaseline;
-        creditSaving = e.creditSaving && !safety;
-        actualInputEff = e.actualInputEff;
-        baselineInputEff = creditSaving ? e.baselineInputEff : actualInputEff;
-        outputEquiv = e.outputEquiv;
-        rawActual = e.rawActual;
-        rawBaseline = e.rawBaseline;
-        baselineForRow = e.rawBaseline;
-        cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
-        warmForRow = ((t as { cached_tokens?: number }).cached_tokens ?? 0) > 0;
-      } else {
-        haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0 || (t.reasoning_tokens ?? 0) > 0;
-        const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
-        const cacheable = (t as { baseline_cacheable_tokens?: number })
-          .baseline_cacheable_tokens ?? 0;
-        const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
-        // Same gating rule as update(): require an explicit 'ok' status when
-        // present; fall back to "have a baseline number" for legacy JSONL.
-        const probeOk = probeStatus === 'ok'
-          || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
-        haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
-        outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
-        // Mirror update(): only credit the cache-modeled counterfactual on
-        // compressed rows. Uncompressed/passthrough rows fall back to the
-        // actual cost so they show zero saved (no fabricated savings).
-        creditSaving = haveBaseline && haveUsage && compressed && !safety;
-        // Warm/cold is reconstructed from server-observed cr only. Persisted
-        // completion ts + duration_ms are used only to find a prior prefix size
-        // for the reused/grown split after cr>0 has proved warmth.
-        const sidR = (t as { first_user_sha8?: string }).first_user_sha8;
-        const prefixShaR = (t as { system_sha8?: string }).system_sha8;
-        const completionSecR = Date.parse(t.ts) / 1000;
-        const requestStartSecR = completionSecR - Math.max(0, t.duration_ms || 0) / 1000;
-        const warmthPrevR =
-          typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
-        // Same cr-only warmth as update(); prior state only refines the split.
-        const { warm: warmR, prevCacheable: prevCacheableR } = deriveBaselineWarmth(
-          warmthPrevR,
-          requestStartSecR,
-          cacheable,
-          cr,
-          DashboardState.CACHE_TTL_SEC,
-          prefixShaR,
-        );
-        baselineInputEff = creditSaving
-          ? computeBaselineInputEff(
-              baseline as number,
-              cacheable,
-              inp,
-              cc,
-              cr,
-              warmR,
-              prevCacheableR,
-            )
-          : actualInputEff;
-        if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
-          this.baselineWarmth.set(sidR, {
-            ts: completionSecR,
-            cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
-            prefixSha: prefixShaR ?? warmthPrevR?.prefixSha,
-          });
-          if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
-            const firstKey = this.baselineWarmth.keys().next().value;
-            if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
-          }
-        }
-        rawActual = inp + cc + cr;
-        rawBaseline = baseline ?? 0;
-        baselineForRow = baseline ?? 0;
-        cacheReadForRow = cr;
-        warmForRow = warmR; // server-observed cache read
+          reasoningTokens: t.reasoning_tokens,
+          cacheCreateTokens: cc,
+          cacheReadTokens: cr,
+          cachedTokens: t.cached_tokens,
+          cacheWriteTokens: t.cache_write_tokens,
+          imageTokens: t.image_tokens,
+          baselineImagedTokens: t.baseline_imaged_tokens,
+          baselineTokens: t.baseline_tokens,
+          baselineCacheableTokens: t.baseline_cacheable_tokens,
+          baselineProbeStatus: t.baseline_probe_status,
+          sessionId: t.first_user_sha8,
+          completionSec,
+          requestStartSec: completionSec - Math.max(0, t.duration_ms || 0) / 1000,
+          prefixSha: t.system_sha8,
+        },
+        { warmth: this.baselineWarmth, cacheTtlSec: DashboardState.CACHE_TTL_SEC },
+      );
+      const {
+        haveUsage,
+        haveBaseline,
+        creditSaving,
+        actualInputEff,
+        baselineInputEff,
+      outputEquiv,
+      rawActualTokens: rawActual,
+      rawBaselineTokens: rawBaseline,
+      cacheReadTokens: cacheReadForRow,
+      cacheWriteTokens: cacheWriteForRow,
+      warm: warmForRow,
+      ordinaryInputTokens,
+    } = acc;
+      const baselineForRow = rawBaseline;
+      if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
+        const firstKey = this.baselineWarmth.keys().next().value;
+        if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
       }
       // Rebuild the Context Map breakdown so old rows keep their "Saved" value
       // and "Details" link after a restart. The PNG ring is in-memory and gone,
@@ -1385,7 +1184,7 @@ export class DashboardState {
           realInput: rawActual,
           baselineInputEff,
           actualInputEff,
-          haveBaseline: haveBaseline && !safety,
+          haveBaseline: creditSaving,
           cacheRead: cacheReadForRow,
           warm: warmForRow,
           output: out,
@@ -1417,7 +1216,7 @@ export class DashboardState {
         this.totals.actualInputWeighted += actualInputEff;
         this.totals.outputWeighted += outputEquiv;
       }
-      if (haveUsage) {
+      if (acc.billableUsage) {
         this.totals.allBaselineEquivalentWeighted += baselineInputEff;
         this.totals.allActualInputWeighted += actualInputEff;
         this.totals.allOutputWeighted += outputEquiv;
@@ -1446,9 +1245,10 @@ export class DashboardState {
       const pt = providerTotalsFor(this.totals.providerTotals, provider);
       pt.requests += 1;
       if (compressed) pt.compressedRequests += 1;
-      if (haveUsage) {
+      if (acc.billableUsage) {
         pt.usageRequests += 1;
         pt.inputTokens += inp;
+        pt.ordinaryInputTokens += ordinaryInputTokens;
         pt.outputTokens += out;
         pt.reasoningTokens += t.reasoning_tokens ?? 0;
         pt.allActualInputWeighted += actualInputEff;
@@ -1465,8 +1265,8 @@ export class DashboardState {
         }
       }
       if (provider === 'openai') {
-        pt.openAICachedTokens += t.cached_tokens ?? 0;
-        pt.openAICacheWriteTokens += t.cache_write_tokens ?? 0;
+        pt.openAICachedTokens += cacheReadForRow;
+        pt.openAICacheWriteTokens += cacheWriteForRow;
       } else if (provider === 'anthropic') {
         pt.anthropicCacheCreateTokens += cc;
         pt.anthropicCacheReadTokens += cr;
@@ -1525,7 +1325,7 @@ export class DashboardState {
           s.rawBaselineTokens += rawBaseline;
           s.rawOutputTokens += out;
         }
-        if (haveUsage) {
+        if (acc.billableUsage) {
           s.allActualInputWeighted += actualInputEff;
           s.allOutputWeighted += outputEquiv;
         }
@@ -1536,15 +1336,17 @@ export class DashboardState {
         }
         sp.requests += 1;
         if (compressed) sp.compressedRequests += 1;
-        if (haveUsage) {
+        if (acc.billableUsage) {
           sp.usageRequests += 1;
           sp.inputTokens += inp;
+          sp.ordinaryInputTokens += ordinaryInputTokens;
           sp.outputTokens += out;
           sp.reasoningTokens += t.reasoning_tokens ?? 0;
-          sp.actualInputWeighted += actualInputEff;
-          sp.outputWeighted += outputEquiv;
-          sp.cacheReadTokens += provider === 'openai' ? (t.cached_tokens ?? 0) : cr;
-          sp.cacheWriteTokens += provider === 'openai' ? (t.cache_write_tokens ?? 0) : cc;
+          sp.allBaselineEquivalentWeighted += baselineInputEff;
+          sp.allActualInputWeighted += actualInputEff;
+          sp.allOutputWeighted += outputEquiv;
+          sp.cacheReadTokens += provider === 'openai' ? cacheReadForRow : cr;
+          sp.cacheWriteTokens += provider === 'openai' ? cacheWriteForRow : cc;
         }
         sp.imageTokens += t.image_tokens ?? 0;
         sp.baselineImagedTokens += t.baseline_imaged_tokens ?? 0;
@@ -1559,6 +1361,8 @@ export class DashboardState {
         if (creditSaving) {
           sp.baselineMeasuredCount += 1;
           sp.baselineInputWeighted += baselineInputEff;
+          sp.actualInputWeighted += actualInputEff;
+          sp.outputWeighted += outputEquiv;
           sp.savedInputWeighted += baselineInputEff - actualInputEff;
           sp.rawActualTokens += rawActual;
           sp.rawBaselineTokens += rawBaseline;
@@ -1572,6 +1376,9 @@ export class DashboardState {
         model: t.model,
         status: t.status,
         compressed,
+        reason: t.reason,
+        error: t.error,
+        error_body: t.error_body,
         provider,
         service_tier: tier,
         stop_reason: t.stop_reason,
@@ -1582,12 +1389,12 @@ export class DashboardState {
         output_tokens: t.output_tokens,
         reasoning_tokens: t.reasoning_tokens,
         cache_create: t.cache_create_tokens,
-        cache_read: gpt ? t.cached_tokens : t.cache_read_tokens,
-        cache_write: gpt ? t.cache_write_tokens : undefined,
-        cached_tokens: gpt ? t.cached_tokens : undefined,
+        cache_read: gpt ? cacheReadForRow : t.cache_read_tokens,
+        cache_write: gpt ? cacheWriteForRow : undefined,
+        cached_tokens: gpt ? cacheReadForRow : undefined,
         ordinary_input_tokens: gpt
           && (t.cached_tokens !== undefined || t.cache_write_tokens !== undefined)
-          ? Math.max(0, inp - (t.cached_tokens ?? 0) - (t.cache_write_tokens ?? 0))
+          ? ordinaryInputTokens
           : undefined,
         image_tokens: gpt ? (t.image_tokens ?? 0) : undefined,
         baseline_imaged_tokens: gpt ? (t.baseline_imaged_tokens ?? 0) : undefined,
@@ -1673,12 +1480,16 @@ export class DashboardState {
           baselineMeasuredCount: p.baselineMeasuredCount,
           baselineInputWeighted: p.baselineInputWeighted,
           actualInputWeighted: p.actualInputWeighted,
+          allBaselineEquivalentWeighted: p.allBaselineEquivalentWeighted,
+          allActualInputWeighted: p.allActualInputWeighted,
+          allOutputWeighted: p.allOutputWeighted,
           outputWeighted: p.outputWeighted,
           savedInputWeighted: p.savedInputWeighted,
           rawActualTokens: p.rawActualTokens,
           rawBaselineTokens: p.rawBaselineTokens,
           rawOutputTokens: p.rawOutputTokens,
           inputTokens: p.inputTokens,
+          ordinaryInputTokens: p.ordinaryInputTokens,
           outputTokens: p.outputTokens,
           reasoningTokens: p.reasoningTokens,
           cacheReadTokens: p.cacheReadTokens,
@@ -1809,6 +1620,7 @@ export class DashboardState {
         compressed_avg_input_weighted: round1(cAvg),
         passthrough_avg_input_weighted: round1(passAvg),
         input_tokens: p.inputTokens,
+        ordinary_input_tokens: p.ordinaryInputTokens,
         output_tokens: p.outputTokens,
         reasoning_tokens: p.reasoningTokens,
         anthropic_cache_create_tokens: p.anthropicCacheCreateTokens,
@@ -1842,6 +1654,7 @@ export class DashboardState {
 
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
+      accounting_basis: 'provider-specific input-credit equivalents; mixed-provider totals are not a single USD currency',
       requests: this.totals.requests,
       compressed_requests: this.totals.compressedRequests,
       baseline_input_weighted: Math.round(baseline),
@@ -1875,9 +1688,13 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      // Back-compat field: Claude-only dollars. A GPT-only run returns zero and
-      // the provider bucket explicitly says monetary_supported=false.
-      saved_usd: round4((anthropic.savedInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      // Back-compat field: Claude-only dollars. A GPT-only run is explicitly
+      // unsupported rather than a misleading numeric zero; consumers that
+      // need to distinguish "no savings" from "not priced" can use null plus
+      // providers.openai.monetary_supported=false.
+      saved_usd: this.totals.providerTotals.has('anthropic')
+        ? round4((anthropic.savedInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6)
+        : null,
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
@@ -1920,7 +1737,7 @@ export class DashboardState {
         },
         openai: {
           monetary_supported: false,
-          unit: 'GPT provider input-credit equivalents (ordinary=1, cached≈0.1, write≈1.25; output≈8)',
+          unit: 'GPT provider input-credit equivalents (ordinary=1, cached≈0.1, GPT-5.6 write≈1.25; output rate is model-specific)',
           cache_read_multiplier: 0.1,
           cache_write_multiplier: 1.25,
           source: 'OpenAI usage telemetry; exact Codex subscription pricing unavailable',

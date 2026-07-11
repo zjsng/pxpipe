@@ -14,6 +14,7 @@
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
+import { accountUsage } from './core/accounting.js';
 import { providerForPath, serviceTierFor, type ProviderId } from './core/provider.js';
 
 // ---- pure aggregator ------------------------------------------------------
@@ -29,7 +30,9 @@ export interface Summary {
    *  from the text path by rendering to PNG. */
   origCharsTotal: number;
   imageBytesTotal: number;
-  /** Aggregated Anthropic token usage. */
+  /** Legacy raw-token counters. `cacheCreate/ReadTokensTotal` are
+   * Anthropic-only for compatibility; OpenAI cache fields have explicit names
+   * below and provider buckets are authoritative for mixed traffic. */
   inputTokensTotal: number;
   ordinaryInputTokensTotal: number;
   outputTokensTotal: number;
@@ -54,6 +57,16 @@ export interface Summary {
   /** Provider-specific telemetry. The legacy top-level counters remain for
    * compatibility, but dollar/accounting consumers must use this map. */
   byProvider: Map<ProviderId, ProviderSummary>;
+  /** Provider-aware savings accumulators. These are provider-credit
+   * equivalents, never a cross-provider USD total. */
+  baselineMeasuredCount: number;
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  savedInputWeighted: number;
+  allBaselineEquivalentWeighted: number;
+  allActualInputWeighted: number;
+  allOutputWeighted: number;
+  accountingWarmth: Map<string, { ts: number; cacheable: number; prefixSha?: string }>;
   modelHist: Map<string, number>;
   serviceTierHist: Map<string, number>;
   stopReasonHist: Map<string, number>;
@@ -93,6 +106,13 @@ export interface ProviderSummary {
   renderCacheMisses: number;
   renderCacheSavedMs: number;
   promptCacheKeyEvents: number;
+  baselineMeasuredCount: number;
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  savedInputWeighted: number;
+  allBaselineEquivalentWeighted: number;
+  allActualInputWeighted: number;
+  allOutputWeighted: number;
 }
 
 function newProviderSummary(provider: ProviderId): ProviderSummary {
@@ -126,6 +146,13 @@ function newProviderSummary(provider: ProviderId): ProviderSummary {
     renderCacheMisses: 0,
     renderCacheSavedMs: 0,
     promptCacheKeyEvents: 0,
+    baselineMeasuredCount: 0,
+    baselineInputWeighted: 0,
+    actualInputWeighted: 0,
+    savedInputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
+    allActualInputWeighted: 0,
+    allOutputWeighted: 0,
   };
 }
 
@@ -159,6 +186,14 @@ export function newSummary(): Summary {
     serviceTierHist: new Map(),
     stopReasonHist: new Map(),
     safetyFlagged: 0,
+    baselineMeasuredCount: 0,
+    baselineInputWeighted: 0,
+    actualInputWeighted: 0,
+    savedInputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
+    allActualInputWeighted: 0,
+    allOutputWeighted: 0,
+    accountingWarmth: new Map(),
   };
 }
 
@@ -188,7 +223,39 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     ps.stopReasons.set(ev.stop_reason, (ps.stopReasons.get(ev.stop_reason) ?? 0) + 1);
     s.stopReasonHist.set(ev.stop_reason, (s.stopReasonHist.get(ev.stop_reason) ?? 0) + 1);
   }
-  if (ev.safety_flagged) {
+  const completionSec = Date.parse(ev.ts) / 1000;
+  const acc = accountUsage(
+    {
+      provider,
+      model: ev.model,
+      status: ev.status,
+      compressed: ev.compressed === true,
+      safetyFlagged: ev.safety_flagged === true
+        || ev.stop_reason === 'refusal'
+        || ev.stop_reason === 'content_filter'
+        || ev.stop_reason === 'safety'
+        || ev.stop_reason === 'safety_refusal'
+        || ev.stop_reason === 'blocked',
+      inputTokens: ev.input_tokens,
+      outputTokens: ev.output_tokens,
+      reasoningTokens: ev.reasoning_tokens,
+      cacheCreateTokens: ev.cache_create_tokens,
+      cacheReadTokens: ev.cache_read_tokens,
+      cachedTokens: ev.cached_tokens,
+      cacheWriteTokens: ev.cache_write_tokens,
+      imageTokens: ev.image_tokens,
+      baselineImagedTokens: ev.baseline_imaged_tokens,
+      baselineTokens: ev.baseline_tokens,
+      baselineCacheableTokens: ev.baseline_cacheable_tokens,
+      baselineProbeStatus: ev.baseline_probe_status,
+      sessionId: ev.first_user_sha8 ?? '<unknown>',
+      completionSec,
+      requestStartSec: completionSec - Math.max(0, ev.duration_ms || 0) / 1000,
+      prefixSha: ev.system_sha8,
+    },
+    { warmth: s.accountingWarmth },
+  );
+  if (acc.safetyFlagged) {
     ps.safetyFlagged++;
     s.safetyFlagged++;
   }
@@ -215,41 +282,53 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
   if (typeof ev.duration_ms === 'number') s.durationMs.push(ev.duration_ms);
   if (typeof ev.first_byte_ms === 'number') s.firstByteMs.push(ev.first_byte_ms);
 
-  const hasUsage =
-    typeof ev.input_tokens === 'number' ||
-    typeof ev.cache_read_tokens === 'number' ||
-    typeof ev.cache_create_tokens === 'number' ||
-    typeof ev.cached_tokens === 'number' ||
-    typeof ev.cache_write_tokens === 'number' ||
-    typeof ev.output_tokens === 'number' ||
-    typeof ev.reasoning_tokens === 'number';
+  const hasUsage = acc.haveUsage;
   if (hasUsage) {
     s.eventsWithUsage++;
     s.inputTokensTotal += ev.input_tokens ?? 0;
-    s.ordinaryInputTokensTotal += provider === 'openai'
-      ? Math.max(0, (ev.input_tokens ?? 0) - (ev.cached_tokens ?? 0) - (ev.cache_write_tokens ?? 0))
-      : ev.input_tokens ?? 0;
+    s.ordinaryInputTokensTotal += acc.ordinaryInputTokens;
     s.outputTokensTotal += ev.output_tokens ?? 0;
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
     s.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
-    s.openAICachedTokensTotal += ev.cached_tokens ?? 0;
-    s.openAICacheWriteTokensTotal += ev.cache_write_tokens ?? 0;
-    if ((ev.cache_read_tokens ?? 0) > 0 || (ev.cached_tokens ?? 0) > 0) s.cacheHitEvents++;
+    s.openAICachedTokensTotal += provider === 'openai' ? acc.cacheReadTokens : 0;
+    s.openAICacheWriteTokensTotal += provider === 'openai' ? acc.cacheWriteTokens : 0;
+    if ((ev.cache_read_tokens ?? 0) > 0 || (provider === 'openai' && acc.cacheReadTokens > 0)) s.cacheHitEvents++;
     ps.eventsWithUsage++;
     ps.inputTokensTotal += ev.input_tokens ?? 0;
-    ps.ordinaryInputTokensTotal += provider === 'openai'
-      ? Math.max(0, (ev.input_tokens ?? 0) - (ev.cached_tokens ?? 0) - (ev.cache_write_tokens ?? 0))
-      : ev.input_tokens ?? 0;
+    ps.ordinaryInputTokensTotal += acc.ordinaryInputTokens;
     ps.outputTokensTotal += ev.output_tokens ?? 0;
     ps.reasoningTokensTotal += ev.reasoning_tokens ?? 0;
     ps.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
     ps.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
-    ps.cachedTokensTotal += ev.cached_tokens ?? 0;
-    ps.cacheWriteTokensTotal += ev.cache_write_tokens ?? 0;
-    if ((ev.cache_read_tokens ?? 0) > 0 || (ev.cached_tokens ?? 0) > 0) ps.cacheHitEvents++;
+    ps.cachedTokensTotal += provider === 'openai' ? acc.cacheReadTokens : 0;
+    ps.cacheWriteTokensTotal += provider === 'openai' ? acc.cacheWriteTokens : 0;
+    if ((ev.cache_read_tokens ?? 0) > 0 || (provider === 'openai' && acc.cacheReadTokens > 0)) ps.cacheHitEvents++;
   }
   ps.imageTokensTotal += ev.image_tokens ?? 0;
   ps.baselineImagedTokensTotal += ev.baseline_imaged_tokens ?? 0;
+
+  // Provider-aware savings. The same helper is used by the live dashboard and
+  // sessions; passthrough, probe-failed, safety, and error rows contribute to
+  // request telemetry but never to the savings numerator.
+  if (acc.creditSaving) {
+    const saved = acc.baselineInputEff - acc.actualInputEff;
+    s.baselineMeasuredCount++;
+    s.baselineInputWeighted += acc.baselineInputEff;
+    s.actualInputWeighted += acc.actualInputEff;
+    s.savedInputWeighted += saved;
+    ps.baselineMeasuredCount++;
+    ps.baselineInputWeighted += acc.baselineInputEff;
+    ps.actualInputWeighted += acc.actualInputEff;
+    ps.savedInputWeighted += saved;
+  }
+  if (acc.billableUsage) {
+    s.allBaselineEquivalentWeighted += acc.baselineInputEff;
+    s.allActualInputWeighted += acc.actualInputEff;
+    s.allOutputWeighted += acc.outputEquiv;
+    ps.allBaselineEquivalentWeighted += acc.baselineInputEff;
+    ps.allActualInputWeighted += acc.actualInputEff;
+    ps.allOutputWeighted += acc.outputEquiv;
+  }
 
   if (ev.cwd) {
     const k = ev.cwd;
@@ -328,33 +407,35 @@ export function renderTextReport(s: Summary): string {
   lines.push(`  bytes/char ratio:   ${ratio}`);
   lines.push('');
 
-  lines.push('Anthropic token usage:');
-  lines.push(`  input:         ${fmtN(s.inputTokensTotal).padStart(12)}`);
-  lines.push(`  output:        ${fmtN(s.outputTokensTotal).padStart(12)}`);
-  lines.push(`  cache create:  ${fmtN(s.cacheCreateTokensTotal).padStart(12)}`);
-  lines.push(`  cache read:    ${fmtN(s.cacheReadTokensTotal).padStart(12)}`);
-  const totalIn =
-    s.inputTokensTotal + s.cacheCreateTokensTotal + s.cacheReadTokensTotal;
-  lines.push(
-    `  cache hit rate (by tokens):  ${fmtPct(s.cacheReadTokensTotal, totalIn)}`,
-  );
-  lines.push(
-    `  cache hit rate (by events):  ${fmtPct(s.cacheHitEvents, s.eventsWithUsage)}`,
-  );
-  lines.push('');
-
-  const openai = s.byProvider.get('openai');
-  if (openai && openai.eventsWithUsage > 0) {
-    lines.push('GPT / OpenAI token telemetry (not Anthropic-priced):');
-    lines.push(`  input:         ${fmtN(openai.inputTokensTotal).padStart(12)}`);
-    lines.push(`  output:        ${fmtN(openai.outputTokensTotal).padStart(12)}`);
-    lines.push(`  reasoning:     ${fmtN(openai.reasoningTokensTotal).padStart(12)}`);
-    lines.push(`  cached read:   ${fmtN(openai.cachedTokensTotal).padStart(12)}`);
-    lines.push(`  cache writes:  ${fmtN(openai.cacheWriteTokensTotal).padStart(12)}`);
-    lines.push(`  image tokens:  ${fmtN(openai.imageTokensTotal).padStart(12)}`);
-    lines.push(`  text baseline: ${fmtN(openai.baselineImagedTokensTotal).padStart(12)}`);
-    lines.push(`  cache hit rate (by events): ${fmtPct(openai.cacheHitEvents, openai.eventsWithUsage)}`);
-    lines.push('  monetary conversion: unsupported — use provider credits/tokens');
+  for (const [provider, p] of s.byProvider) {
+    if (p.eventsWithUsage === 0) continue;
+    if (provider === 'anthropic') {
+      lines.push('Claude / Anthropic token usage:');
+      lines.push(`  input:         ${fmtN(p.inputTokensTotal).padStart(12)}`);
+      lines.push(`  output:        ${fmtN(p.outputTokensTotal).padStart(12)}`);
+      lines.push(`  cache create:  ${fmtN(p.cacheCreateTokensTotal).padStart(12)}`);
+      lines.push(`  cache read:    ${fmtN(p.cacheReadTokensTotal).padStart(12)}`);
+      const totalIn = p.inputTokensTotal + p.cacheCreateTokensTotal + p.cacheReadTokensTotal;
+      lines.push(`  cache hit rate (by tokens):  ${fmtPct(p.cacheReadTokensTotal, totalIn)}`);
+      lines.push(`  cache hit rate (by events):  ${fmtPct(p.cacheHitEvents, p.eventsWithUsage)}`);
+      lines.push(`  provider input saved: ${fmtN(Math.round(p.savedInputWeighted))}`);
+      lines.push('  monetary conversion: use the documented Anthropic model rate');
+    } else if (provider === 'openai') {
+      lines.push('GPT / OpenAI token telemetry (not Anthropic-priced):');
+      lines.push(`  input:         ${fmtN(p.inputTokensTotal).padStart(12)}`);
+      lines.push(`  output:        ${fmtN(p.outputTokensTotal).padStart(12)}`);
+      lines.push(`  reasoning:     ${fmtN(p.reasoningTokensTotal).padStart(12)}`);
+      lines.push(`  cached read:   ${fmtN(p.cachedTokensTotal).padStart(12)}`);
+      lines.push(`  cache writes:  ${fmtN(p.cacheWriteTokensTotal).padStart(12)}`);
+      lines.push(`  image tokens:  ${fmtN(p.imageTokensTotal).padStart(12)}`);
+      lines.push(`  text baseline: ${fmtN(p.baselineImagedTokensTotal).padStart(12)}`);
+      lines.push(`  cache hit rate (by events): ${fmtPct(p.cacheHitEvents, p.eventsWithUsage)}`);
+      lines.push(`  provider input credits saved: ${fmtN(Math.round(p.savedInputWeighted))}`);
+      lines.push('  monetary conversion: unsupported — use provider credits/tokens');
+    } else {
+      lines.push('Other provider telemetry (unpriced):');
+      lines.push(`  input: ${fmtN(p.inputTokensTotal)}  output: ${fmtN(p.outputTokensTotal)}`);
+    }
     lines.push('');
   }
 
@@ -479,6 +560,15 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     openAICacheWriteTokensTotal: s.openAICacheWriteTokensTotal,
     cacheHitEvents: s.cacheHitEvents,
     eventsWithUsage: s.eventsWithUsage,
+    // These are provider-credit equivalents. They are intentionally not
+    // exposed as USD because a mixed Claude/GPT total has no single price.
+    baselineMeasuredCount: s.baselineMeasuredCount,
+    baselineInputWeighted: Math.round(s.baselineInputWeighted),
+    actualInputWeighted: Math.round(s.actualInputWeighted),
+    savedInputWeighted: Math.round(s.savedInputWeighted),
+    allBaselineEquivalentWeighted: Math.round(s.allBaselineEquivalentWeighted),
+    allActualInputWeighted: Math.round(s.allActualInputWeighted),
+    allOutputWeighted: Math.round(s.allOutputWeighted),
     durationP50: percentile(sortedDur, 50),
     durationP95: percentile(sortedDur, 95),
     firstByteP50: percentile(sortedFB, 50),
@@ -522,6 +612,13 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
         renderCacheMisses: p.renderCacheMisses,
         renderCacheSavedMs: p.renderCacheSavedMs,
         promptCacheKeyEvents: p.promptCacheKeyEvents,
+        baselineMeasuredCount: p.baselineMeasuredCount,
+        baselineInputWeighted: Math.round(p.baselineInputWeighted),
+        actualInputWeighted: Math.round(p.actualInputWeighted),
+        savedInputWeighted: Math.round(p.savedInputWeighted),
+        allBaselineEquivalentWeighted: Math.round(p.allBaselineEquivalentWeighted),
+        allActualInputWeighted: Math.round(p.allActualInputWeighted),
+        allOutputWeighted: Math.round(p.allOutputWeighted),
       }]),
     ),
   };

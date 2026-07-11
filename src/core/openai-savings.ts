@@ -56,6 +56,37 @@ export function openAIOutputRate(model: string | undefined): number {
   return 4;
 }
 
+export interface OpenAIInputSplit {
+  /** Ordinary input tokens after clamping provider-reported subsets. */
+  ordinary: number;
+  /** Prompt-cache read tokens (a subset of input). */
+  cached: number;
+  /** Prompt-cache write tokens (a subset of the remaining input). */
+  written: number;
+}
+
+/**
+ * Normalize the OpenAI usage subsets once, so the accounting number, the
+ * dashboard's ordinary-input column, and the sessions/stats rollups cannot
+ * disagree on malformed or overlapping provider telemetry. OpenAI reports
+ * cached and written tokens as subsets of `input_tokens`; neither is additive
+ * to it.
+ */
+export function splitOpenAIInputTokens(
+  inputTokens: number,
+  cachedTokens = 0,
+  cacheWriteTokens = 0,
+): OpenAIInputSplit {
+  const total = Number.isFinite(inputTokens) ? Math.max(0, inputTokens) : 0;
+  const cached = Number.isFinite(cachedTokens)
+    ? Math.min(Math.max(0, cachedTokens), total)
+    : 0;
+  const written = Number.isFinite(cacheWriteTokens)
+    ? Math.min(Math.max(0, cacheWriteTokens), total - cached)
+    : 0;
+  return { ordinary: total - cached - written, cached, written };
+}
+
 export function openAICacheWriteRate(model: string | undefined): number {
   return /^gpt-5\.6(?:-|$)/.test((model ?? '').toLowerCase())
     ? OPENAI_GPT56_CACHE_WRITE_RATE
@@ -70,13 +101,10 @@ export function computeOpenAIActualInputEff(
   model?: string,
   cacheWriteTokens = 0,
 ): number {
-  if (inputTokens <= 0) return 0;
-  const cached = Math.max(0, Math.min(cachedTokens || 0, inputTokens));
-  const written = Math.max(0, Math.min(cacheWriteTokens || 0, inputTokens - cached));
-  const ordinary = inputTokens - cached - written;
-  return ordinary
-    + cached * openAICacheReadRate(model)
-    + written * openAICacheWriteRate(model);
+  const split = splitOpenAIInputTokens(inputTokens, cachedTokens, cacheWriteTokens);
+  return split.ordinary
+    + split.cached * openAICacheReadRate(model)
+    + split.written * openAICacheWriteRate(model);
 }
 
 /** Raw token count for the unproxied GPT counterfactual: replace the rendered
