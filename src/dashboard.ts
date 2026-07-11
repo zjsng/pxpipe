@@ -151,6 +151,17 @@ export interface RecentRow {
   ordinary_input_tokens?: number;
   image_tokens?: number;
   baseline_imaged_tokens?: number;
+  reasoning_items?: number;
+  encrypted_reasoning_items?: number;
+  reasoning_effort?: string;
+  reasoning_context?: string;
+  prompt_cache_key_present?: boolean;
+  prompt_cache_key_fingerprint?: string;
+  render_cache_hits?: number;
+  render_cache_misses?: number;
+  render_cache_saved_ms?: number;
+  request_body_input_bytes?: number;
+  request_body_output_bytes?: number;
   /** input + cache_create×1.25 + cache_read×0.10, from the upstream usage
    *  block. Missing when the request 4xx'd or wasn't /v1/messages. */
   actual_input?: number;
@@ -266,6 +277,12 @@ interface SessionProviderTotals {
   baselineImagedTokens: number;
   models: Map<string, number>;
   serviceTiers: Map<string, number>;
+  reasoningItems: number;
+  encryptedReasoningItems: number;
+  renderCacheHits: number;
+  renderCacheMisses: number;
+  renderCacheSavedMs: number;
+  promptCacheKeyEvents: number;
 }
 
 interface Totals {
@@ -381,6 +398,12 @@ interface ProviderTotals {
   stopReasons: Map<string, number>;
   models: Map<string, number>;
   serviceTiers: Map<string, number>;
+  reasoningItems: number;
+  encryptedReasoningItems: number;
+  renderCacheHits: number;
+  renderCacheMisses: number;
+  renderCacheSavedMs: number;
+  promptCacheKeyEvents: number;
 }
 
 /*
@@ -464,6 +487,12 @@ function newProviderTotals(provider: ProviderId): ProviderTotals {
     stopReasons: new Map(),
     models: new Map(),
     serviceTiers: new Map(),
+    reasoningItems: 0,
+    encryptedReasoningItems: 0,
+    renderCacheHits: 0,
+    renderCacheMisses: 0,
+    renderCacheSavedMs: 0,
+    promptCacheKeyEvents: 0,
   };
 }
 
@@ -521,6 +550,12 @@ function newSessionProviderTotals(provider: ProviderId): SessionProviderTotals {
     baselineImagedTokens: 0,
     models: new Map(),
     serviceTiers: new Map(),
+    reasoningItems: 0,
+    encryptedReasoningItems: 0,
+    renderCacheHits: 0,
+    renderCacheMisses: 0,
+    renderCacheSavedMs: 0,
+    promptCacheKeyEvents: 0,
   };
 }
 
@@ -1061,6 +1096,12 @@ export class DashboardState {
       sp.baselineImagedTokens += info?.baselineImagedTokens ?? 0;
       bump(sp.models, ev.model);
       bump(sp.serviceTiers, tier);
+      sp.reasoningItems += info?.gptReasoningItems ?? 0;
+      sp.encryptedReasoningItems += info?.gptEncryptedReasoningItems ?? 0;
+      sp.renderCacheHits += info?.gptRenderCacheHits ?? 0;
+      sp.renderCacheMisses += info?.gptRenderCacheMisses ?? 0;
+      sp.renderCacheSavedMs += info?.gptRenderCacheSavedMs ?? 0;
+      if (info?.gptPromptCacheKeyPresent) sp.promptCacheKeyEvents += 1;
       if (creditSaving) {
         sp.baselineMeasuredCount += 1;
         sp.baselineInputWeighted += baselineInputEff;
@@ -1121,6 +1162,12 @@ export class DashboardState {
     bump(pt.stopReasons, ev.stopReason);
     bump(pt.models, ev.model);
     bump(pt.serviceTiers, tier);
+    pt.reasoningItems += info?.gptReasoningItems ?? 0;
+    pt.encryptedReasoningItems += info?.gptEncryptedReasoningItems ?? 0;
+    pt.renderCacheHits += info?.gptRenderCacheHits ?? 0;
+    pt.renderCacheMisses += info?.gptRenderCacheMisses ?? 0;
+    pt.renderCacheSavedMs += info?.gptRenderCacheSavedMs ?? 0;
+    if (info?.gptPromptCacheKeyPresent) pt.promptCacheKeyEvents += 1;
     if (creditSaving) {
       pt.baselineMeasuredCount += 1;
       pt.baselineInputWeighted += baselineInputEff;
@@ -1158,6 +1205,17 @@ export class DashboardState {
         : undefined,
       image_tokens: provider === 'openai' ? info?.imageTokens : undefined,
       baseline_imaged_tokens: provider === 'openai' ? info?.baselineImagedTokens : undefined,
+      reasoning_items: info?.gptReasoningItems,
+      encrypted_reasoning_items: info?.gptEncryptedReasoningItems,
+      reasoning_effort: info?.gptReasoningEffort,
+      reasoning_context: info?.gptReasoningContext,
+      prompt_cache_key_present: info?.gptPromptCacheKeyPresent,
+      prompt_cache_key_fingerprint: info?.gptPromptCacheKeyFingerprint,
+      render_cache_hits: info?.gptRenderCacheHits,
+      render_cache_misses: info?.gptRenderCacheMisses,
+      render_cache_saved_ms: info?.gptRenderCacheSavedMs,
+      request_body_input_bytes: info?.requestBodyInputBytes,
+      request_body_output_bytes: info?.requestBodyOutputBytes,
       actual_input: haveUsage ? round1(actualInputEff) : undefined,
       baseline_input: creditSaving ? round1(baselineInputEff) : undefined,
       session_saved_so_far_delta:
@@ -1419,6 +1477,12 @@ export class DashboardState {
       bump(pt.stopReasons, t.stop_reason);
       bump(pt.models, t.model);
       bump(pt.serviceTiers, tier);
+      pt.reasoningItems += t.gpt_reasoning_items ?? 0;
+      pt.encryptedReasoningItems += t.gpt_encrypted_reasoning_items ?? 0;
+      pt.renderCacheHits += t.gpt_render_cache_hits ?? 0;
+      pt.renderCacheMisses += t.gpt_render_cache_misses ?? 0;
+      pt.renderCacheSavedMs += t.gpt_render_cache_saved_ms ?? 0;
+      if (t.gpt_prompt_cache_key_present) pt.promptCacheKeyEvents += 1;
       if (creditSaving) {
         pt.baselineMeasuredCount += 1;
         pt.baselineInputWeighted += baselineInputEff;
@@ -1486,6 +1550,12 @@ export class DashboardState {
         sp.baselineImagedTokens += t.baseline_imaged_tokens ?? 0;
         bump(sp.models, t.model);
         bump(sp.serviceTiers, tier);
+        sp.reasoningItems += t.gpt_reasoning_items ?? 0;
+        sp.encryptedReasoningItems += t.gpt_encrypted_reasoning_items ?? 0;
+        sp.renderCacheHits += t.gpt_render_cache_hits ?? 0;
+        sp.renderCacheMisses += t.gpt_render_cache_misses ?? 0;
+        sp.renderCacheSavedMs += t.gpt_render_cache_saved_ms ?? 0;
+        if (t.gpt_prompt_cache_key_present) sp.promptCacheKeyEvents += 1;
         if (creditSaving) {
           sp.baselineMeasuredCount += 1;
           sp.baselineInputWeighted += baselineInputEff;
@@ -1521,6 +1591,17 @@ export class DashboardState {
           : undefined,
         image_tokens: gpt ? (t.image_tokens ?? 0) : undefined,
         baseline_imaged_tokens: gpt ? (t.baseline_imaged_tokens ?? 0) : undefined,
+        reasoning_items: t.gpt_reasoning_items,
+        encrypted_reasoning_items: t.gpt_encrypted_reasoning_items,
+        reasoning_effort: t.gpt_reasoning_effort,
+        reasoning_context: t.gpt_reasoning_context,
+        prompt_cache_key_present: t.gpt_prompt_cache_key_present,
+        prompt_cache_key_fingerprint: t.gpt_prompt_cache_key_fingerprint,
+        render_cache_hits: t.gpt_render_cache_hits,
+        render_cache_misses: t.gpt_render_cache_misses,
+        render_cache_saved_ms: t.gpt_render_cache_saved_ms,
+        request_body_input_bytes: t.request_body_input_bytes,
+        request_body_output_bytes: t.request_body_output_bytes,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
         baseline_input:
           creditSaving ? round1(baselineInputEff) : undefined,
@@ -1606,6 +1687,12 @@ export class DashboardState {
           baselineImagedTokens: p.baselineImagedTokens,
           models: [...p.models.entries()],
           serviceTiers: [...p.serviceTiers.entries()],
+          reasoningItems: p.reasoningItems,
+          encryptedReasoningItems: p.encryptedReasoningItems,
+          renderCacheHits: p.renderCacheHits,
+          renderCacheMisses: p.renderCacheMisses,
+          renderCacheSavedMs: p.renderCacheSavedMs,
+          promptCacheKeyEvents: p.promptCacheKeyEvents,
         }]),
       ),
     });
@@ -1737,6 +1824,12 @@ export class DashboardState {
         models: [...p.models.entries()],
         service_tiers: [...p.serviceTiers.entries()],
         stop_reasons: [...p.stopReasons.entries()],
+        reasoning_items: p.reasoningItems,
+        encrypted_reasoning_items: p.encryptedReasoningItems,
+        render_cache_hits: p.renderCacheHits,
+        render_cache_misses: p.renderCacheMisses,
+        render_cache_saved_ms: p.renderCacheSavedMs,
+        prompt_cache_key_events: p.promptCacheKeyEvents,
         monetary_supported: p.provider === 'anthropic',
         ...(p.provider === 'anthropic'
           ? { saved_usd: round4((p.savedInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6) }

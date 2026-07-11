@@ -87,6 +87,12 @@ export interface ProviderSummary {
   models: Map<string, number>;
   serviceTiers: Map<string, number>;
   stopReasons: Map<string, number>;
+  reasoningItemsTotal: number;
+  encryptedReasoningItemsTotal: number;
+  renderCacheHits: number;
+  renderCacheMisses: number;
+  renderCacheSavedMs: number;
+  promptCacheKeyEvents: number;
 }
 
 function newProviderSummary(provider: ProviderId): ProviderSummary {
@@ -114,6 +120,12 @@ function newProviderSummary(provider: ProviderId): ProviderSummary {
     models: new Map(),
     serviceTiers: new Map(),
     stopReasons: new Map(),
+    reasoningItemsTotal: 0,
+    encryptedReasoningItemsTotal: 0,
+    renderCacheHits: 0,
+    renderCacheMisses: 0,
+    renderCacheSavedMs: 0,
+    promptCacheKeyEvents: 0,
   };
 }
 
@@ -180,6 +192,12 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     ps.safetyFlagged++;
     s.safetyFlagged++;
   }
+  ps.reasoningItemsTotal += ev.gpt_reasoning_items ?? 0;
+  ps.encryptedReasoningItemsTotal += ev.gpt_encrypted_reasoning_items ?? 0;
+  ps.renderCacheHits += ev.gpt_render_cache_hits ?? 0;
+  ps.renderCacheMisses += ev.gpt_render_cache_misses ?? 0;
+  ps.renderCacheSavedMs += ev.gpt_render_cache_saved_ms ?? 0;
+  if (ev.gpt_prompt_cache_key_present) ps.promptCacheKeyEvents++;
   s.total++;
   if (ev.status >= 200 && ev.status < 300) s.ok2xx++;
   else if (ev.status >= 400 && ev.status < 500) s.err4xx++;
@@ -498,6 +516,12 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
         models: topN(p.models),
         serviceTiers: topN(p.serviceTiers),
         stopReasons: topN(p.stopReasons),
+        reasoningItemsTotal: p.reasoningItemsTotal,
+        encryptedReasoningItemsTotal: p.encryptedReasoningItemsTotal,
+        renderCacheHits: p.renderCacheHits,
+        renderCacheMisses: p.renderCacheMisses,
+        renderCacheSavedMs: p.renderCacheSavedMs,
+        promptCacheKeyEvents: p.promptCacheKeyEvents,
       }]),
     ),
   };

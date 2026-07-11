@@ -230,7 +230,10 @@ export function renderCurrentSessionFragment(p: CurrentSessionPayload): string {
     const savedLine = s.baselineMeasuredCount > 0
       ? `${numFmt(saved)} input credits ${saved >= 0 ? 'saved' : 'lost'} · ${numFmt(s.baselineMeasuredCount)} measured`
       : 'no trustworthy counterfactual yet';
-    return `<div class="session-provider"><div class="session-provider-head"><strong>${name}</strong><span>${numFmt(s.requests)} requests · ${numFmt(s.compressedRequests)} imaged</span></div><div class="session-model"><code>${escapeHtml(models)}</code>${tiers ? ` · tier ${escapeHtml(tiers)}` : ''}</div><div class="session-metrics"><span>input ${numFmt(s.inputTokens)}</span><span>output ${numFmt(s.outputTokens)}</span><span>reasoning ${numFmt(s.reasoningTokens)}</span><span>${openai ? 'prompt cache read' : 'cache read'} ${numFmt(s.cacheReadTokens)}</span><span>cache write ${numFmt(s.cacheWriteTokens)}</span>${openai ? `<span>image ${numFmt(s.imageTokens)} · text base ${numFmt(s.baselineImagedTokens)}</span>` : ''}</div><div class="session-saved">${savedLine}${openai ? ' · GPT credits only; no USD conversion' : ''}</div></div>`;
+    const telemetry = s.reasoningItems || s.renderCacheHits || s.renderCacheMisses || s.promptCacheKeyEvents
+      ? `<span>reasoning items ${numFmt(s.reasoningItems)} (${numFmt(s.encryptedReasoningItems)} encrypted)</span><span>render cache ${numFmt(s.renderCacheHits)} hit / ${numFmt(s.renderCacheMisses)} miss</span><span>cache keys ${numFmt(s.promptCacheKeyEvents)}</span>`
+      : '';
+    return `<div class="session-provider"><div class="session-provider-head"><strong>${name}</strong><span>${numFmt(s.requests)} requests · ${numFmt(s.compressedRequests)} imaged</span></div><div class="session-model"><code>${escapeHtml(models)}</code>${tiers ? ` · tier ${escapeHtml(tiers)}` : ''}</div><div class="session-metrics"><span>input ${numFmt(s.inputTokens)}</span><span>output ${numFmt(s.outputTokens)}</span><span>reasoning ${numFmt(s.reasoningTokens)}</span><span>${openai ? 'prompt cache read' : 'cache read'} ${numFmt(s.cacheReadTokens)}</span><span>cache write ${numFmt(s.cacheWriteTokens)}</span>${openai ? `<span>image ${numFmt(s.imageTokens)} · text base ${numFmt(s.baselineImagedTokens)}</span>` : ''}${telemetry}</div><div class="session-saved">${savedLine}${openai ? ' · GPT credits only; no USD conversion' : ''}</div></div>`;
   }).join('');
   return `<div class="current-session"><div class="current-session-head"><span>Current session</span><code>${escapeHtml(p.sessionId)}</code><span class="hint">restored/live · provider totals</span></div><div class="session-providers">${cards}</div></div>`;
 }
@@ -660,12 +663,19 @@ export function renderRecentFragment(p: RecentPayload): string {
                 ? `${numFmt(output)} <span class="muted">(${numFmt(reasoning)} reasoning)</span>`
                 : numFmt(output);
             const stop = e.stop_reason ? ` <span class="stop" title="stop/refusal status">${escapeHtml(e.stop_reason)}</span>` : '';
+            const telemetry = [
+              e.reasoning_items != null ? `reasoning items ${e.reasoning_items}/${e.encrypted_reasoning_items ?? 0} encrypted` : '',
+              e.reasoning_effort ? `effort ${e.reasoning_effort}` : '',
+              e.reasoning_context ? `context ${e.reasoning_context}` : '',
+              e.prompt_cache_key_present ? 'prompt cache key' : '',
+              e.render_cache_hits != null ? `render cache ${e.render_cache_hits} hit / ${e.render_cache_misses ?? 0} miss` : '',
+            ].filter(Boolean).join(' · ');
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
               `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
-              `<td><span class="provider">${provider}</span>${e.model ? `<br><code>${escapeHtml(e.model)}</code>` : ''}${tier}${stop}</td>` +
+              `<td><span class="provider">${provider}</span>${e.model ? `<br><code>${escapeHtml(e.model)}</code>` : ''}${tier}${stop}${telemetry ? `<br><span class="telemetry">${escapeHtml(telemetry)}</span>` : ''}</td>` +
               `<td>${imaged}${e.image_tokens != null && e.image_tokens > 0 ? `<span class="img-tokens" title="rendered image input tokens"> · ${numFmt(e.image_tokens)} img tok</span>` : ''}</td>` +
               `<td class="num">${cacheRead != null ? numFmt(cacheRead) : '—'}</td>` +
               `<td class="num">${cacheWrite != null ? numFmt(cacheWrite) : '—'}</td>` +
@@ -832,7 +842,9 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     const name = p.provider === 'openai' ? 'GPT / OpenAI' : p.provider === 'anthropic' ? 'Claude / Anthropic' : 'Other';
     const models = (p.models ?? []).map(([m, n]) => `${m} ×${n}`).join(', ') || '—';
     const tiers = (p.serviceTiers ?? []).map(([t, n]) => `${t} ×${n}`).join(', ');
-    return `<tr><td>${name}</td><td><code>${escapeHtml(models)}</code>${tiers ? `<br><span class="muted">${escapeHtml(tiers)}</span>` : ''}</td><td class="num">${numFmt(p.inputTokensTotal)}</td><td class="num">${numFmt(p.outputTokensTotal)}</td><td class="num">${numFmt(p.reasoningTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cachedTokensTotal : p.cacheReadTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cacheWriteTokensTotal : p.cacheCreateTokensTotal)}</td><td class="num">${numFmt(p.imageTokensTotal)}</td><td>${numFmt(p.ok2xx)} ok · ${numFmt(p.err4xx + p.err5xx)} errors${p.safetyFlagged ? ` · ${numFmt(p.safetyFlagged)} safety` : ''}</td></tr>`;
+      const render = p.renderCacheHits != null ? ` · render ${numFmt(p.renderCacheHits)} hit/${numFmt(p.renderCacheMisses)} miss` : '';
+      const reasoning = p.reasoningItemsTotal ? ` · ${numFmt(p.reasoningItemsTotal)} reasoning items` : '';
+      return `<tr><td>${name}</td><td><code>${escapeHtml(models)}</code>${tiers ? `<br><span class="muted">${escapeHtml(tiers)}</span>` : ''}${render || reasoning ? `<br><span class="muted">${escapeHtml((render + reasoning).replace(/^ · /, ''))}</span>` : ''}</td><td class="num">${numFmt(p.inputTokensTotal)}</td><td class="num">${numFmt(p.outputTokensTotal)}</td><td class="num">${numFmt(p.reasoningTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cachedTokensTotal : p.cacheReadTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cacheWriteTokensTotal : p.cacheCreateTokensTotal)}</td><td class="num">${numFmt(p.imageTokensTotal)}</td><td>${numFmt(p.ok2xx)} ok · ${numFmt(p.err4xx + p.err5xx)} errors${p.safetyFlagged ? ` · ${numFmt(p.safetyFlagged)} safety` : ''}</td></tr>`;
   }).join('');
   return (
     `<div class="status">${numFmt(p.parsed)} events parsed from disk</div>` +
@@ -1130,6 +1142,7 @@ const CSS = `
   .provider { font-size: 10px; color: var(--muted); white-space: nowrap; }
   .stop { display: inline-block; margin-top: 2px; font-size: 10px; color: var(--warn); }
   .img-tokens { color: var(--img-ink); font-size: 10px; white-space: nowrap; }
+  .telemetry { color: var(--muted); font-size: 9.5px; line-height: 1.25; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }

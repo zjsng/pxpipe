@@ -92,6 +92,12 @@ export interface DashboardProviderStats {
   models: Array<[string, number]>;
   service_tiers: Array<[string, number]>;
   stop_reasons: Array<[string, number]>;
+  reasoning_items?: number;
+  encrypted_reasoning_items?: number;
+  render_cache_hits?: number;
+  render_cache_misses?: number;
+  render_cache_saved_ms?: number;
+  prompt_cache_key_events?: number;
   monetary_supported: boolean;
   saved_usd?: number;
 }
@@ -141,6 +147,17 @@ export interface RecentRow {
   ordinary_input_tokens?: number;
   image_tokens?: number;
   baseline_imaged_tokens?: number;
+  reasoning_items?: number;
+  encrypted_reasoning_items?: number;
+  reasoning_effort?: string;
+  reasoning_context?: string;
+  prompt_cache_key_present?: boolean;
+  prompt_cache_key_fingerprint?: string;
+  render_cache_hits?: number;
+  render_cache_misses?: number;
+  render_cache_saved_ms?: number;
+  request_body_input_bytes?: number;
+  request_body_output_bytes?: number;
   actual_input?: number;
   baseline_input?: number;
   session_saved_so_far_delta?: number;
@@ -248,6 +265,12 @@ export interface ProviderStatsPayload {
   models: Array<[string, number]>;
   serviceTiers: Array<[string, number]>;
   stopReasons: Array<[string, number]>;
+  reasoningItemsTotal?: number;
+  encryptedReasoningItemsTotal?: number;
+  renderCacheHits?: number;
+  renderCacheMisses?: number;
+  renderCacheSavedMs?: number;
+  promptCacheKeyEvents?: number;
 }
 
 /** POST /api/compression response. */
@@ -298,4 +321,10 @@ export interface CurrentSessionProviderPayload {
   baselineImagedTokens: number;
   models: Array<[string, number]>;
   serviceTiers: Array<[string, number]>;
+  reasoningItems?: number;
+  encryptedReasoningItems?: number;
+  renderCacheHits?: number;
+  renderCacheMisses?: number;
+  renderCacheSavedMs?: number;
+  promptCacheKeyEvents?: number;
 }
