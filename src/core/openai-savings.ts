@@ -2,8 +2,7 @@
  * Cache-aware GPT/OpenAI savings math.
  *
  * This is deliberately separate from src/core/baseline.ts (Anthropic): OpenAI
- * has no `count_tokens`, no explicit cache_control breakpoints, no cache-create
- * premium, and images are billed by OpenAI's vision-token formula rather than
+ * has no `count_tokens`, and images are billed by OpenAI's vision-token formula rather than
  * text tokens. The transform path records two GPT-specific facts per imaged
  * request:
  *
@@ -13,14 +12,15 @@
  *
  * OpenAI usage then tells us how many prompt tokens were served from prompt
  * cache (`cached_tokens`, a subset of input_tokens). For the gpt-5 family, cached
- * input is billed at ~0.1× the normal input rate; there is no 1.25× write
- * premium like Anthropic's ephemeral cache.
+ * input is billed at ~0.1× the normal input rate. GPT-5.6+ additionally reports
+ * cache writes, billed at 1.25×.
  */
 
 import { CACHE_READ_RATE } from './baseline.js';
 
 /** gpt-5 cached input list ratio: $0.125 / $1.25 per 1M tokens. */
 export const OPENAI_GPT5_CACHE_READ_RATE = 0.1;
+export const OPENAI_GPT56_CACHE_WRITE_RATE = 1.25;
 
 /** gpt-5 output/input list ratio: $10 / $1.25 per 1M tokens. */
 export const OPENAI_GPT5_OUTPUT_RATE = 8;
@@ -56,17 +56,27 @@ export function openAIOutputRate(model: string | undefined): number {
   return 4;
 }
 
+export function openAICacheWriteRate(model: string | undefined): number {
+  return /^gpt-5\.6(?:-|$)/.test((model ?? '').toLowerCase())
+    ? OPENAI_GPT56_CACHE_WRITE_RATE
+    : 1;
+}
+
 /** Weighted input tokens actually paid to OpenAI this turn. `cachedTokens` is a
  * subset of `inputTokens`, not an additive bucket. */
 export function computeOpenAIActualInputEff(
   inputTokens: number,
   cachedTokens: number,
   model?: string,
+  cacheWriteTokens = 0,
 ): number {
   if (inputTokens <= 0) return 0;
   const cached = Math.max(0, Math.min(cachedTokens || 0, inputTokens));
-  const uncached = inputTokens - cached;
-  return uncached + cached * openAICacheReadRate(model);
+  const written = Math.max(0, Math.min(cacheWriteTokens || 0, inputTokens - cached));
+  const ordinary = inputTokens - cached - written;
+  return ordinary
+    + cached * openAICacheReadRate(model)
+    + written * openAICacheWriteRate(model);
 }
 
 /** Raw token count for the unproxied GPT counterfactual: replace the rendered
@@ -96,10 +106,15 @@ export function computeOpenAIBaselineInputEff(
   imageTokens: number,
   baselineImagedTokens: number,
   model?: string,
+  cacheWriteTokens = 0,
 ): number {
-  const actual = computeOpenAIActualInputEff(inputTokens, cachedTokens, model);
+  const actual = computeOpenAIActualInputEff(inputTokens, cachedTokens, model, cacheWriteTokens);
   if (inputTokens <= 0 || imageTokens <= 0 || baselineImagedTokens <= 0) return actual;
   const delta = baselineImagedTokens - imageTokens;
-  const deltaWeight = (cachedTokens || 0) > 0 ? openAICacheReadRate(model) : 1.0;
+  const deltaWeight = (cachedTokens || 0) > 0
+    ? openAICacheReadRate(model)
+    : (cacheWriteTokens || 0) > 0
+      ? openAICacheWriteRate(model)
+      : 1.0;
   return actual + delta * deltaWeight;
 }

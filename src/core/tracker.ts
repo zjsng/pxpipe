@@ -115,6 +115,13 @@ export interface TrackEvent {
   cache_read_tokens?: number;
   /** OpenAI prompt-cache hits (subset of input_tokens), from input/prompt_tokens_details.cached_tokens. */
   cached_tokens?: number;
+  /** GPT-5.6+ cache writes (subset of input_tokens, billed at write rate). */
+  cache_write_tokens?: number;
+  /** GPT history-only compression telemetry. */
+  history_baseline_tokens?: number;
+  history_image_tokens?: number;
+  history_barrier_index?: number;
+  history_barrier_kind?: string;
   /** Cache_create split by tier — 1.25x (5-min) and 2x (1-hour) input rates.
    *  Their sum equals `cache_create_tokens` when both fields are present. */
   cache_create_5m_tokens?: number;
@@ -269,6 +276,16 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.historyTextChars !== undefined && info.historyTextChars > 0) {
       out.history_text_chars = info.historyTextChars;
     }
+    if (info.historyBaselineTokens !== undefined && info.historyBaselineTokens > 0) {
+      out.history_baseline_tokens = info.historyBaselineTokens;
+    }
+    if (info.historyImageTokens !== undefined && info.historyImageTokens > 0) {
+      out.history_image_tokens = info.historyImageTokens;
+    }
+    if (info.historyBarrierIndex !== undefined) {
+      out.history_barrier_index = info.historyBarrierIndex;
+      out.history_barrier_kind = info.historyBarrierKind ?? 'unknown';
+    }
     if (info.historyImageSha) {
       out.history_image_sha8 = info.historyImageSha;
     }
@@ -311,6 +328,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.cache_read_tokens = u.cache_read_input_tokens;
     if (u.cached_tokens !== undefined)
       out.cached_tokens = u.cached_tokens;
+    if (u.cache_write_tokens !== undefined)
+      out.cache_write_tokens = u.cache_write_tokens;
     // cache_creation splits cache_creation_input_tokens across 5-min (1.25x) and 1-hour (2x) tiers.
     if (u.cache_creation) {
       if (u.cache_creation.ephemeral_5m_input_tokens !== undefined)

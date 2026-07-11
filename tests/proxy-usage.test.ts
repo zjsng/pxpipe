@@ -497,7 +497,7 @@ describe('proxy usage extraction', () => {
           status: 'completed',
           usage: {
             input_tokens: 321,
-            input_tokens_details: { cached_tokens: 200 },
+            input_tokens_details: { cached_tokens: 200, cache_write_tokens: 40 },
             output_tokens: 17,
             total_tokens: 338,
           },
@@ -538,6 +538,7 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.usage?.input_tokens).toBe(321);
     expect(captured!.usage?.cached_tokens).toBe(200);
+    expect(captured!.usage?.cache_write_tokens).toBe(40);
     expect(captured!.usage?.output_tokens).toBe(17);
     expect(captured!.model).toBe('gpt-5.6-terra');
     expect(captured!.stopReason).toBe('stop');

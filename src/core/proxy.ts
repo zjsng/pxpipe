@@ -252,6 +252,9 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   if (details && typeof details.cached_tokens === 'number') {
     out.cached_tokens = details.cached_tokens;
   }
+  if (details && typeof details.cache_write_tokens === 'number') {
+    out.cache_write_tokens = details.cache_write_tokens;
+  }
 
   return Object.keys(out).length > 0 ? out : undefined;
 }

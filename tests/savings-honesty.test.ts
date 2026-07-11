@@ -25,6 +25,7 @@ import {
   computeOpenAIActualInputEff,
   computeOpenAIBaselineRawTokens,
   openAICacheReadRate,
+  openAICacheWriteRate,
 } from '../src/core/openai-savings.js';
 
 const GPT = 'gpt-5.6-sol';
@@ -168,6 +169,20 @@ describe('per-model pricing is applied correctly (Fable vs Opus vs GPT)', () => 
     expect(openAICacheReadRate('claude-sonnet-5')).toBe(0.1);
     expect(openAICacheReadRate('gpt-4o')).not.toBe(0.1);
     expect(openAICacheReadRate(undefined)).not.toBe(0.1);
+  });
+
+  it('prices GPT-5.6 cache writes at 1.25× without charging older GPT-5.5 writes', () => {
+    expect(openAICacheWriteRate('gpt-5.6-sol')).toBe(1.25);
+    expect(openAICacheWriteRate('gpt-5.5')).toBe(1);
+    // 1k cached + 2k written + 7k ordinary = 100 + 2500 + 7000.
+    expect(computeOpenAIActualInputEff(10_000, 1_000, 'gpt-5.6-sol', 2_000)).toBe(9_600);
+    expect(computeOpenAIActualInputEff(10_000, 1_000, 'gpt-5.5', 2_000)).toBe(9_100);
+  });
+
+  it('weights a cold text counterfactual at the GPT-5.6 write rate when the request wrote cache', () => {
+    const actual = computeOpenAIActualInputEff(10_000, 0, GPT, 10_000);
+    const baseline = computeOpenAIBaselineInputEff(10_000, 0, 1_000, 5_000, GPT, 10_000);
+    expect(baseline - actual).toBe((5_000 - 1_000) * 1.25);
   });
 
   it('GPT and Anthropic read rates happen to coincide (0.1×) but are sourced independently', () => {

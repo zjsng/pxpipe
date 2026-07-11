@@ -183,6 +183,27 @@ describe('aggregateSessions', () => {
     expect(s.requestCount).toBe(4);
   });
 
+  it('credits GPT image savings and prices GPT-5.6 cache writes separately', async () => {
+    writeEvents(tmp, [
+      ev({
+        path: '/responses',
+        model: 'gpt-5.6-terra',
+        first_user_sha8: 'gpt56',
+        compressed: true,
+        input_tokens: 10_000,
+        cached_tokens: 8_000,
+        cache_write_tokens: 1_000,
+        image_tokens: 1_000,
+        baseline_imaged_tokens: 5_000,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    const s = sessions.get('gpt56')!;
+    // Warm text/image delta is discounted at the same 0.1x read rate.
+    expect(s.tokensSavedEst).toBe(400);
+    expect(s.cacheReadTokens).toBe(8_000);
+  });
+
   it('reports a real NEGATIVE when cache_create overhead exceeds the prefix saving; probe-miss credits 0', async () => {
     writeEvents(tmp, [
       // Probe miss: no marker -> credit nothing (was a ~95000-token fabrication

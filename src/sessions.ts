@@ -34,6 +34,10 @@ import {
   computeBaselineInputEff,
   deriveBaselineWarmth,
 } from './core/baseline.js';
+import {
+  computeOpenAIActualInputEff,
+  computeOpenAIBaselineInputEff,
+} from './core/openai-savings.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -123,6 +127,10 @@ function sessionIdOf(ev: TrackEvent): string {
   return ev.first_user_sha8 ?? UNKNOWN_SESSION;
 }
 
+function isOpenAIEvent(ev: TrackEvent): boolean {
+  return ev.path.includes('responses') || ev.path.includes('chat/completions');
+}
+
 export interface AggregateResult {
   sessions: Map<string, SessionSummary>;
   /** sessionId -> set of absolute sidecar paths referenced by its events. */
@@ -182,7 +190,32 @@ export async function aggregateSessions(
     const cr = ev.cache_read_tokens ?? 0;
     const haveUsage = inp > 0 || cc > 0 || cr > 0;
     const baseline = ev.baseline_tokens;
+    const gpt = isOpenAIEvent(ev);
+    if (gpt && inp > 0) {
+      const image = ev.image_tokens ?? 0;
+      const baselineImaged = ev.baseline_imaged_tokens ?? 0;
+      if (image > 0 && baselineImaged > 0 && ev.compressed === true) {
+        const actualEff = computeOpenAIActualInputEff(
+          inp,
+          ev.cached_tokens ?? 0,
+          ev.model,
+          ev.cache_write_tokens ?? 0,
+        );
+        const baselineEff = computeOpenAIBaselineInputEff(
+          inp,
+          ev.cached_tokens ?? 0,
+          image,
+          baselineImaged,
+          ev.model,
+          ev.cache_write_tokens ?? 0,
+        );
+        const tokensSaved = baselineEff - actualEff;
+        s.tokensSavedEst += Math.round(tokensSaved);
+        s.charsSaved += Math.round(tokensSaved * 4);
+      }
+    }
     if (
+      !gpt &&
       typeof baseline === 'number' &&
       baseline > 0 &&
       haveUsage
@@ -229,9 +262,7 @@ export async function aggregateSessions(
         prefixSha: prefixSha ?? prev?.prefixSha,
       });
     }
-    if (typeof ev.cache_read_tokens === 'number') {
-      s.cacheReadTokens += ev.cache_read_tokens;
-    }
+    s.cacheReadTokens += gpt ? (ev.cached_tokens ?? 0) : (ev.cache_read_tokens ?? 0);
     if (ev.req_body_sample_path) {
       let set = sidecarsBySession.get(id);
       if (!set) {

@@ -129,6 +129,8 @@ export interface FullStatsSummary {
   inputTokensTotal: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
+  openAICachedTokensTotal: number;
+  openAICacheWriteTokensTotal: number;
   outputTokensTotal: number;
   cacheHitEvents: number;
   eventsWithBaseline: number;

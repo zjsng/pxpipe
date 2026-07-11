@@ -599,6 +599,12 @@ export interface TransformInfo {
   bucketChars?: BucketChars;
   /** Chars fed into the history-image renderer. Folded into `bucketChars.history` too. */
   historyTextChars?: number;
+  /** GPT history tokens only, separated from the static slab for live tuning. */
+  historyBaselineTokens?: number;
+  historyImageTokens?: number;
+  /** Latest opaque Responses item preserved immediately before the collapsed suffix. */
+  historyBarrierIndex?: number;
+  historyBarrierKind?: string;
   /** Blocks pinned as text by the caller's `keepSharp` predicate this request. */
   keptSharpBlocks?: number;
   /** Imaged live-region blocks with original text + provenance, when `emitRecoverable`. */
@@ -628,6 +634,7 @@ export interface TransformInfo {
   historyReason?:
     | 'no_history'
     | 'prefix_too_short'
+    | 'opaque_barrier'
     | 'no_closed_prefix'
     | 'below_min_chars'
     | 'below_min_tokens'
