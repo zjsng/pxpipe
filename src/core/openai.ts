@@ -7,7 +7,6 @@
  */
 
 import {
-  renderTextToPngs,
   reflow,
   shrinkColsToContent,
   renderCellWidth,
@@ -44,6 +43,7 @@ import {
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { appendIdsBlock, factSheetText } from './factsheet.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { renderOpenAITextCached } from './openai-render-cache.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -221,6 +221,23 @@ function isReasoningItem(item: unknown): item is Record<string, unknown> {
   return !!item && typeof item === 'object' && (item as { type?: unknown }).type === 'reasoning';
 }
 
+function telemetryFingerprint(value: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `fnv-${(h >>> 0).toString(16).padStart(8, '0')}-${value.length}`;
+}
+
+function jsonUtf8Bytes(value: unknown): number {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  } catch {
+    return 0;
+  }
+}
+
 function addExplicitBreakpoint(req: Record<string, unknown>, kind: Gpt56RequestKind): boolean {
   const items = kind === 'chat' ? req.messages : req.input;
   if (!Array.isArray(items)) return false;
@@ -285,9 +302,27 @@ export function applyGpt56RequestOptimizations(
   if (kind === 'responses' && Array.isArray(req.input)) {
     const reasoningItems = req.input.filter(isReasoningItem);
     info.gptReasoningItems = reasoningItems.length;
-    info.gptEncryptedReasoningItems = reasoningItems.filter(
+    const encryptedItems = reasoningItems.filter(
       (item) => typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0,
-    ).length;
+    );
+    info.gptEncryptedReasoningItems = encryptedItems.length;
+    info.gptReasoningBytes = reasoningItems.reduce((sum, item) => sum + jsonUtf8Bytes(item), 0);
+    info.gptEncryptedReasoningBytes = encryptedItems.reduce(
+      (sum, item) => sum + new TextEncoder().encode(item.encrypted_content as string).byteLength,
+      0,
+    );
+  }
+
+  if (req.reasoning && typeof req.reasoning === 'object' && !Array.isArray(req.reasoning)) {
+    const reasoning = req.reasoning as Record<string, unknown>;
+    if (typeof reasoning.effort === 'string') info.gptReasoningEffort = reasoning.effort;
+    if (typeof reasoning.context === 'string') info.gptReasoningContext = reasoning.context;
+  }
+  if (typeof req.prompt_cache_key === 'string' && req.prompt_cache_key.length > 0) {
+    info.gptPromptCacheKeyPresent = true;
+    info.gptPromptCacheKeyFingerprint = telemetryFingerprint(req.prompt_cache_key);
+  } else {
+    info.gptPromptCacheKeyPresent = false;
   }
   return changed ? new TextEncoder().encode(JSON.stringify(req)) : body;
 }
@@ -851,6 +886,9 @@ function foldGptHistory(
   info.historyTextChars = plan.collapsedChars;
   info.historyReason = 'collapsed';
   info.bucketChars = { ...(info.bucketChars ?? {}), history: plan.collapsedChars };
+  info.gptRenderCacheHits = (info.gptRenderCacheHits ?? 0) + plan.renderCacheHits;
+  info.gptRenderCacheMisses = (info.gptRenderCacheMisses ?? 0) + plan.renderCacheMisses;
+  info.gptRenderCacheSavedMs = (info.gptRenderCacheSavedMs ?? 0) + plan.renderCacheSavedMs;
 }
 
 const CHAT_HEADER =
@@ -958,7 +996,16 @@ export async function transformOpenAIChatCompletions(
     return { body, info };
   }
 
-  const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
+  const slabRender = await renderOpenAITextCached(
+    renderedText,
+    cols,
+    profile.maxHeightPx,
+    profile.style,
+  );
+  const images = slabRender.images;
+  info.gptRenderCacheHits = slabRender.cacheHit ? 1 : 0;
+  info.gptRenderCacheMisses = slabRender.cacheHit ? 0 : 1;
+  info.gptRenderCacheSavedMs = slabRender.savedRenderMs;
   if (images.length === 0) {
     info.reason = 'render_empty';
     return { body, info };
@@ -1178,7 +1225,16 @@ export async function transformOpenAIResponses(
     return { body, info };
   }
 
-  const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
+  const slabRender = await renderOpenAITextCached(
+    renderedText,
+    cols,
+    profile.maxHeightPx,
+    profile.style,
+  );
+  const images = slabRender.images;
+  info.gptRenderCacheHits = slabRender.cacheHit ? 1 : 0;
+  info.gptRenderCacheMisses = slabRender.cacheHit ? 0 : 1;
+  info.gptRenderCacheSavedMs = slabRender.savedRenderMs;
   if (images.length === 0) {
     info.reason = 'render_empty';
     return { body, info };

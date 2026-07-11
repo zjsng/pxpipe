@@ -574,6 +574,26 @@ export interface TransformInfo {
   gptReasoningItems?: number;
   /** Outgoing reasoning items carrying encrypted_content for stateless replay. */
   gptEncryptedReasoningItems?: number;
+  /** Deterministic GPT slab/history renders served from the process-local LRU. */
+  gptRenderCacheHits?: number;
+  /** GPT renders that populated the process-local LRU this request. */
+  gptRenderCacheMisses?: number;
+  /** Measured render milliseconds from original misses avoided by cache hits. */
+  gptRenderCacheSavedMs?: number;
+  /** Request JSON bytes before and after pxpipe's GPT/Anthropic rewrite. */
+  requestBodyInputBytes?: number;
+  requestBodyOutputBytes?: number;
+  /** Caller-selected GPT reasoning controls, observed without modification. */
+  gptReasoningEffort?: string;
+  gptReasoningContext?: string;
+  /** JSON bytes occupied by all replayed reasoning items. */
+  gptReasoningBytes?: number;
+  /** UTF-8 bytes occupied specifically by encrypted_content strings. */
+  gptEncryptedReasoningBytes?: number;
+  /** Whether the outgoing request carries a prompt-cache routing key. */
+  gptPromptCacheKeyPresent?: boolean;
+  /** Non-cryptographic telemetry fingerprint; the raw routing key is never logged. */
+  gptPromptCacheKeyFingerprint?: string;
   /** sha8 of the CLAUDE.md section, for bucketing by project when cwd is absent. */
   claudeMdSha8?: string;
   /** sha8 of first user message text (first 4 KiB). Rough thread/session id. */

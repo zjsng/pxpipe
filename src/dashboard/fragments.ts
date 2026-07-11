@@ -137,7 +137,7 @@ export function renderModelsFragment(
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   return (
     `<div class="models">` +
-    `<span class="models-label">Image Claude models</span>` +
+    `<span class="models-label">Image Claude models · Anthropic</span>` +
     claudeChips +
     `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
     `</div>` +
@@ -185,6 +185,8 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   const baselineW = s.baseline_input_weighted ?? 0; // same context as text, cache-aware
   const actualW = s.actual_input_weighted ?? 0; // what we actually sent, cache-aware
   const outMult = s.pricing_assumptions?.output_multiplier || 5;
+  const hasOpenAI = Boolean(s.providers?.openai);
+  const hasAnthropic = Boolean(s.providers?.anthropic) || !hasOpenAI;
   const rawOutput = (s.output_weighted ?? 0) / outMult; // reply — never compressed
   const inputPct = baselineW > 0 ? (1 - actualW / baselineW) * 100 : 0;
   const positive = inputPct >= 0;
@@ -193,19 +195,44 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
 
   return (
     `<div class="hero${positive ? '' : ' hero-neg'}">` +
-    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged</div>` +
-    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after caching</div>` +
+    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged · ${hasOpenAI && !hasAnthropic ? 'GPT / OpenAI credits' : 'provider input equivalents'}</div>` +
+    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after observed provider caching</div>` +
     `<div class="hero-sub">` +
     `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
     `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
-    `Your latest messages and Claude's live output are never compressed.` +
+    `Your latest messages and model output are never compressed.` +
     `</div>` +
     `<div class="hero-meta">` +
-    `Cache-aware — cached reads counted at their real ~0.1× weight, not full price · ` +
+    `Provider-aware — cached reads use the observed provider rate, not a Claude price assumption · ` +
     `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
     `</div>` +
     `</div>`
   );
+}
+
+/** Current-session strip. Unlike the lifetime hero, this is restored from the
+ * event log after restart and keeps GPT/Codex telemetry visibly separate from
+ * Claude accounting. */
+export function renderCurrentSessionFragment(p: CurrentSessionPayload): string {
+  if (!p.sessionId) {
+    return `<div class="current-session empty-note">No tagged generation session yet — provider totals will appear after the first request.</div>`;
+  }
+  const providers = Object.values(p.providers ?? {});
+  if (providers.length === 0) {
+    return `<div class="current-session empty-note">Current session <code>${escapeHtml(p.sessionId)}</code> has no provider usage yet.</div>`;
+  }
+  const cards = providers.map((s) => {
+    const openai = s.provider === 'openai';
+    const name = openai ? 'GPT / OpenAI' : s.provider === 'anthropic' ? 'Claude / Anthropic' : 'Other provider';
+    const models = s.models.map(([m, n]) => `${m} ×${n}`).join(', ') || 'model not reported';
+    const tiers = s.serviceTiers.map(([t, n]) => `${t} ×${n}`).join(', ');
+    const saved = s.savedInputWeighted;
+    const savedLine = s.baselineMeasuredCount > 0
+      ? `${numFmt(saved)} input credits ${saved >= 0 ? 'saved' : 'lost'} · ${numFmt(s.baselineMeasuredCount)} measured`
+      : 'no trustworthy counterfactual yet';
+    return `<div class="session-provider"><div class="session-provider-head"><strong>${name}</strong><span>${numFmt(s.requests)} requests · ${numFmt(s.compressedRequests)} imaged</span></div><div class="session-model"><code>${escapeHtml(models)}</code>${tiers ? ` · tier ${escapeHtml(tiers)}` : ''}</div><div class="session-metrics"><span>input ${numFmt(s.inputTokens)}</span><span>output ${numFmt(s.outputTokens)}</span><span>reasoning ${numFmt(s.reasoningTokens)}</span><span>${openai ? 'prompt cache read' : 'cache read'} ${numFmt(s.cacheReadTokens)}</span><span>cache write ${numFmt(s.cacheWriteTokens)}</span>${openai ? `<span>image ${numFmt(s.imageTokens)} · text base ${numFmt(s.baselineImagedTokens)}</span>` : ''}</div><div class="session-saved">${savedLine}${openai ? ' · GPT credits only; no USD conversion' : ''}</div></div>`;
+  }).join('');
+  return `<div class="current-session"><div class="current-session-head"><span>Current session</span><code>${escapeHtml(p.sessionId)}</code><span class="hint">restored/live · provider totals</span></div><div class="session-providers">${cards}</div></div>`;
 }
 
 // ---- stat strip + "Show the math" drawer ----------------------------------
@@ -241,12 +268,38 @@ function statTile(
 
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
+  const hasOpenAI = Boolean(s.providers?.openai);
+  const hasAnthropic = Boolean(s.providers?.anthropic) || !hasOpenAI;
+  const unitLabel = hasOpenAI ? 'Input credits saved' : 'Input tokens saved';
+  const savedTile = hasAnthropic
+    ? statTile(
+        'Estimated Claude input saved',
+        `$${(s.saved_usd ?? 0).toFixed(2)}`,
+        `at $${pa.input_per_mtok}/M Anthropic input tokens`,
+        '',
+        'Claude / Anthropic only. GPT / Codex usage is never converted with this rate.',
+      )
+    : statTile(
+        'Estimated USD saved',
+        'not priced',
+        'GPT / Codex subscription pricing is not exposed',
+        'muted-val',
+        'No monetary conversion is claimed for GPT / Codex. Use the provider-credit and token telemetry instead.',
+      );
 
   // stat strip
   const splitReady = s.split_sufficient_sample;
   const cAvg = s.compressed_avg_usd_per_request ?? 0;
   const pAvg = s.passthrough_avg_usd_per_request ?? 0;
-  const costTile = splitReady
+  const costTile = !hasAnthropic
+    ? statTile(
+        'Claude cost per request',
+        'not applicable',
+        'GPT / Codex shown as provider credits below',
+        'muted-val',
+        'The proxy does not have an exact monetary rate for this GPT / Codex subscription transport.',
+      )
+    : splitReady
     ? statTile(
         'Cost per request',
         `$${cAvg.toFixed(4)}`,
@@ -266,40 +319,37 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<div class="strip">` +
     statTile('Requests', numFmt(s.requests), `${numFmt(s.compressed_requests)} turned into images`) +
     statTile(
-      'Input tokens saved',
+      unitLabel,
       numFmt(s.saved_input_tokens),
-      'vs sending the same context as text',
+      hasOpenAI ? 'provider billing-equivalent units; no cross-provider USD' : 'vs sending the same context as text',
       'pos',
       'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — recent turns and the live output stay text.',
     ) +
-    statTile(
-      'Estimated saved',
-      `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      `at $${pa.input_per_mtok}/M input tokens`,
-      '',
-      'A rough dollar figure: saved tokens × the input price. Actual savings depend on your plan and caching — see the math drawer.',
-    ) +
+    savedTile +
     costTile +
     `</div>`;
 
   // math drawer
   const savedMath =
-    `<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>` +
-    `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create×1.25, cache_read×0.10</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">provider saved credits = counterfactual − actual</span></div>` +
+    `<div><span class="k">weights:</span> <span class="v">${hasOpenAI && !hasAnthropic ? 'GPT ordinary×1.0, cached≈0.1, write≈1.25, output≈8; image tokens vs o200k text baseline' : 'Claude input×1.0, cache_create×1.25, cache_read×0.10'}</span></div>` +
     `<div class="sp"></div>` +
     mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable×weight + cold_tail)') +
     mathRow('actual', s.actual_input_weighted, '(input + cc×1.25 + cr×0.10 from usage)') +
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
-    `<span class="src">output excluded — identical with/without compression</span>`;
+    `<span class="src">output is untouched and shown separately; provider buckets prevent cross-provider pricing</span>`;
 
-  const usdMath =
-    `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens × $${pa.input_per_mtok}/Mtok</span></div>` +
-    `<div class="sp"></div>` +
-    mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
-    mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> saved_tokens × input_rate / 1e6`) +
-    `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
+  const usdMath = hasAnthropic
+    ? `<div><span class="k">formula:</span> <span class="v">Claude $ saved = Claude saved input equivalents × $${pa.input_per_mtok}/Mtok</span></div>` +
+      `<div class="sp"></div>` +
+      mathRow('Claude_saved_tokens', s.saved_input_tokens, '(provider bucket; cache-aware, input-side)') +
+      mathRow('Claude_saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> Claude saved × input_rate / 1e6`) +
+      `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')} · GPT / Codex excluded</span>`
+    : `<div><span class="k">formula:</span> <span class="v">USD conversion unavailable for GPT / Codex subscription traffic</span></div>` +
+      `<div class="sp"></div>` +
+      `<span class="src">Use GPT input credits, cached reads, cache writes, image tokens, and text counterfactual instead. No Claude rate applied.</span>`;
 
-  const splitMath =
+  const splitMath = hasAnthropic ?
     `<div><span class="k">formula:</span> <span class="v">bucket_$ = (Σ actual_input + Σ output × ${pa.output_multiplier}) × $${pa.input_per_mtok}/Mtok</span></div>` +
     `<div><span class="k">why:</span> <span class="v">partition the paid-rows set by which path actually ran (compressed vs passthrough). Same $/Mtok on both sides so the rate assumption cancels in the delta. Selection bias (the gate routes each turn) does NOT cancel — read with the sample counts.</span></div>` +
     `<div class="sp"></div>` +
@@ -312,7 +362,10 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
         ? `(both buckets ≥ ${s.split_min_sample_per_bucket} — delta is meaningful)`
         : `(small sample: need ≥ ${s.split_min_sample_per_bucket} per bucket; treat as noisy)`,
     ) +
-    `<span class="src">no counterfactual, no probe gate — pure observed $/req on each path</span>`;
+    `<span class="src">no counterfactual, no probe gate — pure observed Claude $/req on each path; GPT is excluded</span>`
+    : `<div><span class="k">formula:</span> <span class="v">GPT observed input-credit split = actual provider credits by compressed vs passthrough path</span></div>` +
+      `<div class="sp"></div>` +
+      `<span class="src">No exact GPT / Codex USD per request is available. See provider buckets for cached reads, writes, output/reasoning, and image tokens.</span>`;
 
   const pctMath =
     `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
@@ -323,11 +376,11 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathRow(`all_output × ${pa.output_multiplier}`, s.all_output_weighted, '(every paid request)') +
     mathRow('share_of_spend', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> saved / counterfactual_total × 100`) +
     mathRow('all_usage_requests', s.all_usage_requests, '(denominator request count — compressed + passthrough + probe-failed)') +
-    `<span class="src">measured numerator, all-rows counterfactual denominator — bounded at 100%</span>`;
+    `<span class="src">provider input-credit diagnostic; do not compare across Claude and GPT as dollars</span>`;
 
   const tokeqMath =
-    `<div><span class="k">formula:</span> <span class="v">token_equivalent = input + output × ${pa.output_multiplier}</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">matches Anthropic's per-Mtok price ratio ($${pa.input_per_mtok} input vs $${pa.input_per_mtok * pa.output_multiplier} output) — this is what the weekly-limit meter counts.</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">provider input-credit equivalent = input + provider output multiplier</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">Claude uses its documented input/output ratio; GPT / Codex uses telemetry credits and is not converted to Claude dollars.</span></div>` +
     `<div class="sp"></div>` +
     mathRow('actual_token_equivalent', s.actual_token_equivalent) +
     mathRow('baseline_token_equivalent', s.baseline_token_equivalent, `(unproxied counterfactual, same ×${pa.output_multiplier} on output)`) +
@@ -425,6 +478,9 @@ export function renderContextMapFragment(
   // prefix would have been a cheap cache-read, so it must NOT drive the
   // headline. It survives only as a clarifying sub-line below.
   const showCompare = c.haveBaseline && c.baselineInputEff > 0;
+  const provider = c.provider ?? 'anthropic';
+  const providerName = provider === 'openai' ? 'GPT / OpenAI' : provider === 'anthropic' ? 'Claude / Anthropic' : 'provider';
+  const modelLabel = c.model ? ` · ${escapeHtml(c.model)}` : '';
   const base = c.baselineInputEff;
   const real = c.actualInputEff;
   const pct = showCompare ? Math.round((1 - real / base) * 100) : 0;
@@ -481,14 +537,16 @@ export function renderContextMapFragment(
         .join('') +
       `</div>`
     : c.restored && c.imageCount > 0
-      ? `<div class="pages-title">${c.imageCount} image page${c.imageCount === 1 ? '' : 's'} were sent — thumbnails expired when the proxy restarted. The breakdown above is reconstructed from the saved log.</div>`
+      ? `<div class="pages-title">${c.imageCount} image page${c.imageCount === 1 ? '' : 's'} were sent to ${escapeHtml(providerName)} — thumbnails expired when the proxy restarted. The breakdown above is reconstructed from the saved log.</div>`
       : '';
 
   // Did the TEXT baseline's prefix read warm this turn? This follows the actual
   // request's observed cache state: cache_read > 0 means warm, cache_read === 0
   // means cold. No wall-clock-only counterfactual is credited.
   const warm = showCompare && c.warm;
-  const textNoun = warm ? 'cached text' : 'text';
+  const textNoun = warm
+    ? provider === 'openai' ? 'prompt-cached text' : 'cached text'
+    : 'text';
   // Raw count_tokens can grow (imaging bloated a short prompt), so say so rather
   // than rendering a nonsensical "shrank -36%".
   const rawPhrase =
@@ -502,17 +560,23 @@ export function renderContextMapFragment(
   // a 0.1× read discount when cache_read===0 would count hypothetical cache as a
   // pxpipe effect, so cold rows price both paths cold.
   const subnote = !showCompare
-    ? 'Billed tokens count cache discounts (reads at 0.1×) — no trustworthy text baseline for this request yet.'
+    ? `${c.safetyFlagged ? `Comparison withheld: upstream reported ${escapeHtml(c.stopReason || 'safety')} — ` : ''}Billing-equivalent input tokens after ${providerName} cache accounting — no trustworthy text baseline for this request yet.`
     : !warm
-      ? `No warm text cache this turn — the text counterfactual's prefix is priced at the 1.25× create rate (the same event the imaged path pays), identical basis to the Saved column. The gap is purely token count. ${rawPhrase}`
+      ? provider === 'openai'
+        ? `No prompt-cache read was reported this turn — both the text counterfactual and the image path use ordinary input credits. The gap is purely token count. ${rawPhrase}`
+        : `No warm text cache this turn — the text counterfactual's prefix is priced at the 1.25× create rate (the same event the imaged path pays), identical basis to the Saved column. The gap is purely token count. ${rawPhrase}`
       : pct < 0 && rawShrink > 0
-          ? `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. The raw text is ${rawShrink}% smaller, but most of it would have been a cheap cache-read — so imaging it cost more.`
-          : `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. ${rawPhrase}`;
+          ? provider === 'openai'
+            ? `GPT prompt-cache reads are discounted at the observed provider rate; the raw text is ${rawShrink}% smaller, but imaging it cost more on this turn.`
+            : `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. The raw text is ${rawShrink}% smaller, but most of it would have been a cheap cache-read — so imaging it cost more.`
+          : provider === 'openai'
+            ? `GPT / OpenAI billing-equivalent credits use the observed prompt-cache state. ${rawPhrase}`
+            : `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. ${rawPhrase}`;
   const title = isLatest ? 'Latest request' : 'Selected request';
 
   return (
     `<div class="ctxmap">` +
-    `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline}</div>` +
+    `<div class="ctx-headline"><span class="ctx-title">${title}${modelLabel}</span> ${headline}</div>` +
     `<div class="split-note ctx-subnote">${subnote}</div>` +
     `<div class="legend"><span class="tag tag-img">Became an image</span><span class="tag tag-txt">Stayed as text</span></div>` +
     `<div class="split">` +
@@ -522,7 +586,7 @@ export function renderContextMapFragment(
     `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
-    `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
+    `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact · ${escapeHtml(providerName)}</span></div>` +
     `<div class="ctx-row"><span class="ctx-lbl">Your latest messages</span><span class="ctx-val">verbatim</span></div>` +
     `<div class="ctx-row"><span class="ctx-lbl">Model reply (output)</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
     `<div class="split-note">never imaged — safe for IDs, hashes and exact numbers.</div>` +
@@ -546,9 +610,13 @@ export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
   const body =
     rows.length === 0
-      ? `<tr><td colspan="10" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
+      ? `<tr><td colspan="12" class="empty-cell">No generation requests yet — discovery polls are kept out of this table; errors remain visible.</td></tr>`
       : rows
           .map((e: RecentRow, i: number) => {
+            const provider = e.provider === 'openai'
+              ? 'GPT / OpenAI'
+              : e.provider === 'other' ? 'Other' : 'Claude / Anthropic';
+            const tier = e.service_tier ? ` · ${escapeHtml(e.service_tier)}` : '';
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
             const viewLink =
               viewId != null
@@ -568,27 +636,43 @@ export function renderRecentFragment(p: RecentPayload): string {
             const createNote = createLoss
               ? ` <span class="mk-create" title="Cache-create turn: this loss is the one-time ${CACHE_CREATE_RATE}× premium for writing ${numFmt(cc)} tokens to cache. Later turns re-read that prefix at ${CACHE_READ_RATE}×, which typically recoups it.">create</span>`
               : '';
-            const savedCell = saved == null
+            const savedCell = e.safety_flagged
+              ? `<td class="num muted" title="Savings comparison withheld for a safety refusal/content filter result">blocked</td>`
+              : saved == null
               ? `<td class="num muted">—</td>`
               : saved > 0
                 ? `<td class="num pos">${numFmt(saved)}</td>`
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
-            const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+            const imaged = e.sent_as === 'error' || e.status >= 400
+              ? `<span class="badge badge-bad">error</span>`
+              : e.sent_as === 'image' || e.cc_added
+                ? `<span class="badge badge-img">image</span>`
+                : `<span class="badge badge-txt">text</span>`;
+            const cacheRead = e.cache_read ?? e.cached_tokens;
+            const cacheWrite = e.cache_write ?? e.cache_create;
+            const output = e.output_tokens;
+            const reasoning = e.reasoning_tokens;
+            const outputCell = output == null
+              ? '—'
+              : reasoning != null && reasoning > 0
+                ? `${numFmt(output)} <span class="muted">(${numFmt(reasoning)} reasoning)</span>`
+                : numFmt(output);
+            const stop = e.stop_reason ? ` <span class="stop" title="stop/refusal status">${escapeHtml(e.stop_reason)}</span>` : '';
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
               `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
-              `<td>${e.model ? `<code>${escapeHtml(e.model)}</code>` : '<span class="muted">—</span>'}</td>` +
-              `<td>${imaged}</td>` +
-              `<td class="num">${e.cache_read != null ? numFmt(e.cache_read) : '—'}</td>` +
+              `<td><span class="provider">${provider}</span>${e.model ? `<br><code>${escapeHtml(e.model)}</code>` : ''}${tier}${stop}</td>` +
+              `<td>${imaged}${e.image_tokens != null && e.image_tokens > 0 ? `<span class="img-tokens" title="rendered image input tokens"> · ${numFmt(e.image_tokens)} img tok</span>` : ''}</td>` +
+              `<td class="num">${cacheRead != null ? numFmt(cacheRead) : '—'}</td>` +
+              `<td class="num">${cacheWrite != null ? numFmt(cacheWrite) : '—'}</td>` +
               `<td class="num">${e.baseline_input != null ? numFmt(e.baseline_input) : '—'}</td>` +
               `<td class="num">${e.actual_input != null ? numFmt(e.actual_input) : '—'}</td>` +
               savedCell +
+              `<td class="num">${outputCell}</td>` +
               `<td class="num">${viewLink}</td>` +
               `</tr>`
             );
@@ -599,12 +683,14 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>#</th>` +
     `<th>Result</th>` +
     `<th>Endpoint</th>` +
-    `<th>Model</th>` +
+    `<th>Provider / model</th>` +
     `<th title="Was this request's context compressed into an image?">Sent as</th>` +
-    `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
-    `<th class="num" title="Billing-equivalent input if kept as plain text, after cache create/read rates">As text</th>` +
-    `<th class="num" title="Actual billing-equivalent input after imaging, after cache create/read rates">Sent</th>` +
-    `<th class="num" title="As-text minus Sent; negative means imaging cost more">Saved/lost</th>` +
+    `<th class="num" title="Prompt/cache tokens reported as reused by the upstream provider">Cache read</th>` +
+    `<th class="num" title="Prompt/cache tokens written or created this turn">Cache write</th>` +
+    `<th class="num" title="Provider-specific billing-equivalent input if kept as plain text; GPT is credit-equivalent, not Claude dollars">As text</th>` +
+    `<th class="num" title="Provider-specific billing-equivalent input actually sent">Sent</th>` +
+    `<th class="num" title="As-text minus Sent; negative means imaging cost more. Safety results are withheld.">Saved/lost</th>` +
+    `<th class="num" title="Output tokens; reasoning subset shown in parentheses when reported. Output is never compressed.">Output / reasoning</th>` +
     `<th></th>` +
     `</tr></thead><tbody>${body}</tbody></table>`
   );
@@ -617,6 +703,9 @@ export interface LatestFragmentInput {
   pin: number | null; // pinned image id, or null to follow latest
   showSource: boolean;
   sourceText: string | null; // null = not captured
+  provider?: 'anthropic' | 'openai' | 'other';
+  model?: string;
+  serviceTier?: string;
 }
 
 export function renderLatestFragment(inp: LatestFragmentInput): string {
@@ -624,6 +713,14 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
   const hasPreview = payload.has_preview === true;
   const meta = payload.preview_meta ?? '';
   const imageIds = payload.image_ids ?? [];
+  const previewProviderId = inp.provider ?? payload.preview_provider;
+  const previewProvider = previewProviderId === 'openai'
+    ? 'GPT / OpenAI'
+    : previewProviderId === 'other' ? 'other provider' : 'Claude / Anthropic';
+  const previewModelValue = inp.model ?? payload.preview_model;
+  const previewModel = previewModelValue ? ` · ${escapeHtml(previewModelValue)}` : '';
+  const previewTierValue = inp.serviceTier ?? payload.preview_service_tier;
+  const previewTier = previewTierValue ? ` · tier ${escapeHtml(previewTierValue)}` : '';
   const pinnedEvicted = pin != null && !imageIds.includes(pin);
 
   // Pinned id, or latest (cache-busted by meta).
@@ -649,7 +746,9 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
 
   const showBtn = pin != null ? !pinnedEvicted : hasPreview;
   const caption =
-    pin != null ? `image #${pin}` : meta ? `${escapeHtml(meta)} · top-left at native size` : '';
+    pin != null
+      ? `image #${pin} · ${previewProvider}${previewModel}${previewTier}`
+      : meta ? `${escapeHtml(meta)} · ${previewProvider}${previewModel}${previewTier} · top-left at native size` : '';
   const srcBtn = showBtn
     ? `<button class="mini-btn" type="button" onclick="ppSource(${showSource ? 'false' : 'true'})">${showSource ? 'hide source text' : 'show the text behind this image'}</button>`
     : '';
@@ -660,7 +759,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
       sourceText == null
         ? `<div class="evicted">source text wasn't captured for this image</div>`
         : `<div class="pairing">` +
-          `<div class="pair-col"><div class="pair-head pair-img">What Claude sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
+          `<div class="pair-col"><div class="pair-head pair-img">What ${escapeHtml(previewProvider)} sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
           `<div class="pair-mid">made from ↓</div>` +
           `<div class="pair-col"><div class="pair-head pair-txt">Text rendered on this page</div><pre class="src-pane">${escapeHtml(sourceText)}</pre></div>` +
           `</div>`;
@@ -682,7 +781,9 @@ export function renderSessionsFragment(p: SessionsPayload): string {
 
   const label = (s: SessionRow) => {
     const proj = s.claudeCode?.projectPath || s.project;
-    return proj ? shortPath(proj) : s.id.slice(0, 8);
+    const base = proj ? shortPath(proj) : s.id.slice(0, 8);
+    const models = s.models?.slice(0, 2).join(', ');
+    return models ? `${base} · ${models}` : base;
   };
   const barPct = (v: number) => (max <= 0 || v <= 0 ? 0 : (v / max) * 100);
 
@@ -696,9 +797,9 @@ export function renderSessionsFragment(p: SessionsPayload): string {
       const fill = pct > 0 ? `<div class="bar-fill" style="width:max(3px,${pct}%)"></div>` : '';
       return (
         `<div class="bar-row">` +
-        `<div class="bar-label" title="${escapeHtml(s.claudeCode?.projectPath || s.project || s.id)}">${escapeHtml(label(s))}</div>` +
+        `<div class="bar-label" title="${escapeHtml((s.claudeCode?.projectPath || s.project || s.id) + (s.models?.length ? ` · models: ${s.models.join(', ')}` : ''))}">${escapeHtml(label(s))}</div>` +
         `<div class="bar-track">${fill}</div>` +
-        `<div class="bar-val${v < 0 ? ' neg' : ''}">${numFmt(v)}</div>` +
+        `<div class="bar-val${v < 0 ? ' neg' : ''}">${numFmt(v)} credits</div>` +
         `</div>`
       );
     })
@@ -707,7 +808,7 @@ export function renderSessionsFragment(p: SessionsPayload): string {
   return (
     status +
     `<div class="bars">${chart}</div>` +
-    `<div class="axis">tokens saved per session (cache-aware) · top ${rows.length} of ${all.length}</div>`
+    `<div class="axis">provider input credits saved per session (cache-aware; GPT is not converted to Claude USD) · top ${rows.length} of ${all.length}</div>`
   );
 }
 
@@ -727,6 +828,12 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
 
   // NOTE: the literal word "requests" is asserted by tests.
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;
+  const providerRows = Object.values(s.byProvider ?? {}).map((p) => {
+    const name = p.provider === 'openai' ? 'GPT / OpenAI' : p.provider === 'anthropic' ? 'Claude / Anthropic' : 'Other';
+    const models = (p.models ?? []).map(([m, n]) => `${m} ×${n}`).join(', ') || '—';
+    const tiers = (p.serviceTiers ?? []).map(([t, n]) => `${t} ×${n}`).join(', ');
+    return `<tr><td>${name}</td><td><code>${escapeHtml(models)}</code>${tiers ? `<br><span class="muted">${escapeHtml(tiers)}</span>` : ''}</td><td class="num">${numFmt(p.inputTokensTotal)}</td><td class="num">${numFmt(p.outputTokensTotal)}</td><td class="num">${numFmt(p.reasoningTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cachedTokensTotal : p.cacheReadTokensTotal)}</td><td class="num">${numFmt(p.provider === 'openai' ? p.cacheWriteTokensTotal : p.cacheCreateTokensTotal)}</td><td class="num">${numFmt(p.imageTokensTotal)}</td><td>${numFmt(p.ok2xx)} ok · ${numFmt(p.err4xx + p.err5xx)} errors${p.safetyFlagged ? ` · ${numFmt(p.safetyFlagged)} safety` : ''}</td></tr>`;
+  }).join('');
   return (
     `<div class="status">${numFmt(p.parsed)} events parsed from disk</div>` +
     `<table class="dtable"><tbody>` +
@@ -737,14 +844,19 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('input tokens', numFmt(s.inputTokensTotal)) +
     tr('cache create', numFmt(s.cacheCreateTokensTotal)) +
     tr('cache read', numFmt(s.cacheReadTokensTotal)) +
-    tr('cache hit (by tokens)', hitRateTok) +
-    tr('cache hit (by events)', hitRateEv) +
+    tr('Claude cache hit (by tokens)', hitRateTok) +
+    tr('Claude cache hit (by events)', hitRateEv) +
     tr('original chars', numFmt(s.origCharsTotal)) +
     tr('image bytes', numFmt(s.imageBytesTotal)) +
     tr('bytes / char', charRatio) +
     tr('latency p50 / p95', `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
     tr('first-byte p50 / p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
-    `</tbody></table>`
+    `</tbody></table>` +
+    `<h3 class="card-head spaced">Provider telemetry</h3>` +
+    `<table class="dtable"><thead><tr><th>provider</th><th>models / tiers</th><th class="num">input</th><th class="num">output</th><th class="num">reasoning</th><th class="num">cache read</th><th class="num">cache write</th><th class="num">image tokens</th><th class="num">status</th></tr></thead><tbody>` +
+    (providerRows || `<tr><td colspan="9" class="empty-cell">No provider telemetry yet.</td></tr>`) +
+    `</tbody></table>` +
+    `<div class="status provider-footnote">GPT / Codex values are provider telemetry and credit-equivalents only; no Anthropic USD conversion is claimed.</div>`
   );
 }
 
@@ -863,6 +975,17 @@ const CSS = `
   .hero-meta { font-size: 12px; color: var(--muted); margin-top: 10px; padding-top: 10px;
     border-top: 1px dashed var(--border-strong); }
   .hero-empty .hero-headline { color: var(--muted); font-size: 24px; }
+  .current-session { margin: 0 0 16px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 16px; box-shadow: var(--shadow); }
+  .current-session-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; color: var(--ink-2); font-size: 12px; font-weight: 700; margin-bottom: 9px; }
+  .current-session-head code { color: var(--flame-ink); font-weight: 600; }
+  .session-providers { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 9px; }
+  .session-provider { background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; padding: 9px 11px; min-width: 0; }
+  .session-provider-head { display: flex; justify-content: space-between; gap: 8px; color: var(--ink); font-size: 12px; }
+  .session-provider-head span, .session-model, .session-metrics, .session-saved { color: var(--muted); font-size: 10.5px; }
+  .session-model { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session-metrics { display: flex; flex-wrap: wrap; gap: 4px 9px; margin-top: 7px; }
+  .session-saved { margin-top: 7px; color: var(--flame-ink); font-weight: 600; }
 
   /* stat strip */
   .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
@@ -1003,6 +1126,10 @@ const CSS = `
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .badge-bad { background: var(--bad-tint); color: var(--bad); }
+  .provider { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .stop { display: inline-block; margin-top: 2px; font-size: 10px; color: var(--warn); }
+  .img-tokens { color: var(--img-ink); font-size: 10px; white-space: nowrap; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -1136,7 +1263,7 @@ export function renderPage(port: number): string {
     <span class="flame-dot"></span>
     <div>
       <div class="wordmark">pxpipe</div>
-      <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
+      <div class="tagline">See exactly what became images, what stayed text, and how each provider billed it.</div>
     </div>
   </div>
   <div class="controls">
@@ -1147,9 +1274,10 @@ export function renderPage(port: number): string {
 
 <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
 
-<div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
+  <div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
   <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>
 </div>
+<div id="frag-current-session" hx-get="/fragments/current-session" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
 
 <div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
 

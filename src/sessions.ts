@@ -38,6 +38,7 @@ import {
   computeOpenAIActualInputEff,
   computeOpenAIBaselineInputEff,
 } from './core/openai-savings.js';
+import { providerForPath, serviceTierFor, type ProviderId } from './core/provider.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -45,7 +46,7 @@ export interface SessionSummary {
   /** The synthetic session ID = first_user_sha8 (or '<unknown>' if missing). */
   id: string;
   /** Working directory of the first event in the session, if any. */
-  project: string | undefined;
+  project: string | null;
   /** ISO timestamp of the first event we saw for this session. */
   firstSeen: string;
   /** ISO timestamp of the last event we saw for this session. */
@@ -64,6 +65,16 @@ export interface SessionSummary {
   tokensSavedEst: number;
   /** Sum of cache_read_input_tokens — actual prompt-cache hits. */
   cacheReadTokens: number;
+  /** Provider-neutral cache-write telemetry (Anthropic create + GPT writes). */
+  cacheWriteTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  imageTokens: number;
+  /** Provider/model labels observed in this session. */
+  providers: ProviderId[];
+  models: string[];
+  serviceTiers: string[];
   /** Bytes attributable to this session in events.jsonl (sum of line lengths
    *  including the trailing newline). */
   jsonlBytes: number;
@@ -128,7 +139,7 @@ function sessionIdOf(ev: TrackEvent): string {
 }
 
 function isOpenAIEvent(ev: TrackEvent): boolean {
-  return ev.path.includes('responses') || ev.path.includes('chat/completions');
+  return providerForPath(ev.path, ev.model) === 'openai';
 }
 
 export interface AggregateResult {
@@ -161,13 +172,21 @@ export async function aggregateSessions(
     if (!s) {
       s = {
         id,
-        project: ev.cwd,
+        project: ev.cwd ?? null,
         firstSeen: ev.ts,
         lastSeen: ev.ts,
         requestCount: 0,
         charsSaved: 0,
         tokensSavedEst: 0,
         cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        imageTokens: 0,
+        providers: [],
+        models: [],
+        serviceTiers: [],
         jsonlBytes: 0,
         sidecarBytes: 0,
       };
@@ -179,7 +198,12 @@ export async function aggregateSessions(
     if (ev.ts > s.lastSeen) s.lastSeen = ev.ts;
     // Cling to whichever cwd we saw first; sessions that hop directories are
     // rare and the first cwd is the most stable identifier.
-    if (s.project === undefined && ev.cwd) s.project = ev.cwd;
+    if (s.project === null && ev.cwd) s.project = ev.cwd;
+    const provider = providerForPath(ev.path, ev.model);
+    if (!s.providers.includes(provider)) s.providers.push(provider);
+    if (ev.model && !s.models.includes(ev.model)) s.models.push(ev.model);
+    const tier = serviceTierFor(ev.model, ev.service_tier);
+    if (tier && !s.serviceTiers.includes(tier)) s.serviceTiers.push(tier);
     // Real per-session savings, cache-aware. See src/core/baseline.ts for the
     // full derivation: pxpipe is credited only for token reduction, never for
     // caching. The imagined text baseline gets the SAME observed cache state as
@@ -188,13 +212,17 @@ export async function aggregateSessions(
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
-    const haveUsage = inp > 0 || cc > 0 || cr > 0;
+    const haveUsage = inp > 0 || cc > 0 || cr > 0
+      || (ev.cached_tokens ?? 0) > 0
+      || (ev.cache_write_tokens ?? 0) > 0
+      || (ev.output_tokens ?? 0) > 0
+      || (ev.reasoning_tokens ?? 0) > 0;
     const baseline = ev.baseline_tokens;
     const gpt = isOpenAIEvent(ev);
-    if (gpt && inp > 0) {
+    if (gpt && haveUsage) {
       const image = ev.image_tokens ?? 0;
       const baselineImaged = ev.baseline_imaged_tokens ?? 0;
-      if (image > 0 && baselineImaged > 0 && ev.compressed === true) {
+      if (image > 0 && baselineImaged > 0 && ev.compressed === true && !ev.safety_flagged) {
         const actualEff = computeOpenAIActualInputEff(
           inp,
           ev.cached_tokens ?? 0,
@@ -263,6 +291,11 @@ export async function aggregateSessions(
       });
     }
     s.cacheReadTokens += gpt ? (ev.cached_tokens ?? 0) : (ev.cache_read_tokens ?? 0);
+    s.cacheWriteTokens += gpt ? (ev.cache_write_tokens ?? 0) : (ev.cache_create_tokens ?? 0);
+    s.inputTokens += ev.input_tokens ?? 0;
+    s.outputTokens += ev.output_tokens ?? 0;
+    s.reasoningTokens += ev.reasoning_tokens ?? 0;
+    s.imageTokens += ev.image_tokens ?? 0;
     if (ev.req_body_sample_path) {
       let set = sidecarsBySession.get(id);
       if (!set) {

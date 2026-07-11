@@ -21,17 +21,9 @@
  * HistoryTurn list and the planner/renderer are shared.
  */
 
-import {
-  renderTextToPngs,
-  reflow,
-
-  neutralizeSentinel,
-  type RenderedImage,
-  type RenderStyle,
-} from './render.js';
-import { appendIdsBlock } from './factsheet.js';
-
-import { DEFAULT_GPT_PROFILE, GPT_MAX_HEIGHT_PX } from './gpt-model-profiles.js';
+import { reflow, neutralizeSentinel, type RenderedImage } from './render.js';
+import { renderOpenAITextCached } from './openai-render-cache.js';
+import { GPT_MAX_HEIGHT_PX } from './gpt-model-profiles.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 /** Portrait-strip width for GPT history images. Mirrors GPT_STRIP_COLS in
@@ -211,6 +203,9 @@ export interface GptCollapsePlan {
     | 'render_empty';
   droppedChars: number;
   droppedCodepoints: Map<number, number>;
+  renderCacheHits: number;
+  renderCacheMisses: number;
+  renderCacheSavedMs: number;
 }
 
 function safeJson(v: unknown): string {
@@ -292,6 +287,9 @@ export async function planGptCollapse(
     collapsedChars: 0,
     droppedChars: 0,
     droppedCodepoints: new Map(),
+    renderCacheHits: 0,
+    renderCacheMisses: 0,
+    renderCacheSavedMs: 0,
   };
   const pp = Math.max(0, Math.min(protectedPrefix, turns.length));
   const rawCutoff = turns.length - o.keepTail;
@@ -433,16 +431,25 @@ export async function planGptCollapse(
   const rendered: Array<{ s: number; e: number; imgs: RenderedImage[] }> = [];
   let imgCount = 0;
   let collapseEnd = pp;
+  let renderCacheHits = 0;
+  let renderCacheMisses = 0;
+  let renderCacheSavedMs = 0;
   for (const [s, e] of sections) {
     const sectionText = joinTurns(turns, s, e, -1);
     if (!sectionText || sectionText.length === 0) continue;
     const safeSection = neutralizeSentinel(sectionText);
-    let sectionRender = o.reflow ? reflow(safeSection) ?? safeSection : sectionText;
-    if (o.idsBlock) sectionRender = appendIdsBlock(sectionRender);
-    // Readable portrait strips (≤768px wide) — legible to OpenAI vision, same as
-    // the static slab. renderTextToPngs caps each PNG at MAX_HEIGHT_PX so a tall
-    // section pages into N images, all still well under the 10,000-patch budget.
-    const sectionImgs = await renderTextToPngs(sectionRender, o.cols, o.style ?? {}, o.maxHeightPx);
+    const sectionRender = o.reflow ? reflow(safeSection) ?? safeSection : sectionText;
+    // Readable portrait strips (≤768px wide), matching the static slab.
+    // GPT-5.6 original detail preserves these exact dimensions; the profile cap
+    // is aligned to 32px patch bands so full pages pay for no blank edge patch.
+    const sectionResult = await renderOpenAITextCached(sectionRender, o.cols, o.maxHeightPx, o.style ?? {});
+    const sectionImgs = sectionResult.images;
+    if (sectionResult.cacheHit) {
+      renderCacheHits++;
+      renderCacheSavedMs += sectionResult.savedRenderMs;
+    } else {
+      renderCacheMisses++;
+    }
     if (imgCount + sectionImgs.length > maxImages) {
       // TRUE cap: keep the sections already selected, leave this and every later
       // section (and the pin, if not yet reached) as normal text in the remainder.
@@ -501,6 +508,9 @@ export async function planGptCollapse(
     collapsedChars: collapsedText.length,
     droppedChars,
     droppedCodepoints,
+    renderCacheHits,
+    renderCacheMisses,
+    renderCacheSavedMs,
   };
 }
 

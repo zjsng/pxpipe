@@ -14,6 +14,7 @@
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
+import { providerForPath, serviceTierFor, type ProviderId } from './core/provider.js';
 
 // ---- pure aggregator ------------------------------------------------------
 
@@ -30,6 +31,7 @@ export interface Summary {
   imageBytesTotal: number;
   /** Aggregated Anthropic token usage. */
   inputTokensTotal: number;
+  ordinaryInputTokensTotal: number;
   outputTokensTotal: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
@@ -49,6 +51,70 @@ export interface Summary {
    *  be doing its job. */
   systemShaHist: Map<string, number>;
   unknownTags: Map<string, number>;
+  /** Provider-specific telemetry. The legacy top-level counters remain for
+   * compatibility, but dollar/accounting consumers must use this map. */
+  byProvider: Map<ProviderId, ProviderSummary>;
+  modelHist: Map<string, number>;
+  serviceTierHist: Map<string, number>;
+  stopReasonHist: Map<string, number>;
+  safetyFlagged: number;
+}
+
+/** Full-history provider bucket. Values are raw telemetry unless the field is
+ * explicitly named `...Weighted`; no OpenAI value is silently converted to an
+ * Anthropic-priced dollar amount. */
+export interface ProviderSummary {
+  provider: ProviderId;
+  total: number;
+  ok2xx: number;
+  err4xx: number;
+  err5xx: number;
+  compressed: number;
+  passthrough: number;
+  eventsWithUsage: number;
+  inputTokensTotal: number;
+  ordinaryInputTokensTotal: number;
+  outputTokensTotal: number;
+  reasoningTokensTotal: number;
+  cacheCreateTokensTotal: number;
+  cacheReadTokensTotal: number;
+  cachedTokensTotal: number;
+  cacheWriteTokensTotal: number;
+  imageTokensTotal: number;
+  baselineImagedTokensTotal: number;
+  cacheHitEvents: number;
+  safetyFlagged: number;
+  models: Map<string, number>;
+  serviceTiers: Map<string, number>;
+  stopReasons: Map<string, number>;
+}
+
+function newProviderSummary(provider: ProviderId): ProviderSummary {
+  return {
+    provider,
+    total: 0,
+    ok2xx: 0,
+    err4xx: 0,
+    err5xx: 0,
+    compressed: 0,
+    passthrough: 0,
+    eventsWithUsage: 0,
+    inputTokensTotal: 0,
+    ordinaryInputTokensTotal: 0,
+    outputTokensTotal: 0,
+    reasoningTokensTotal: 0,
+    cacheCreateTokensTotal: 0,
+    cacheReadTokensTotal: 0,
+    cachedTokensTotal: 0,
+    cacheWriteTokensTotal: 0,
+    imageTokensTotal: 0,
+    baselineImagedTokensTotal: 0,
+    cacheHitEvents: 0,
+    safetyFlagged: 0,
+    models: new Map(),
+    serviceTiers: new Map(),
+    stopReasons: new Map(),
+  };
 }
 
 export function newSummary(): Summary {
@@ -62,6 +128,7 @@ export function newSummary(): Summary {
     origCharsTotal: 0,
     imageBytesTotal: 0,
     inputTokensTotal: 0,
+    ordinaryInputTokensTotal: 0,
     outputTokensTotal: 0,
     cacheCreateTokensTotal: 0,
     cacheReadTokensTotal: 0,
@@ -75,10 +142,44 @@ export function newSummary(): Summary {
     byCwd: new Map(),
     systemShaHist: new Map(),
     unknownTags: new Map(),
+    byProvider: new Map(),
+    modelHist: new Map(),
+    serviceTierHist: new Map(),
+    stopReasonHist: new Map(),
+    safetyFlagged: 0,
   };
 }
 
 export function fold(s: Summary, ev: TrackEvent): Summary {
+  const provider = providerForPath(ev.path, ev.model);
+  let ps = s.byProvider.get(provider);
+  if (!ps) {
+    ps = newProviderSummary(provider);
+    s.byProvider.set(provider, ps);
+  }
+  ps.total++;
+  if (ev.status >= 200 && ev.status < 300) ps.ok2xx++;
+  else if (ev.status >= 400 && ev.status < 500) ps.err4xx++;
+  else if (ev.status >= 500) ps.err5xx++;
+  if (ev.compressed === true) ps.compressed++;
+  else if (ev.compressed === false) ps.passthrough++;
+  if (ev.model) {
+    ps.models.set(ev.model, (ps.models.get(ev.model) ?? 0) + 1);
+    s.modelHist.set(ev.model, (s.modelHist.get(ev.model) ?? 0) + 1);
+  }
+  const tier = serviceTierFor(ev.model, ev.service_tier);
+  if (tier) {
+    ps.serviceTiers.set(tier, (ps.serviceTiers.get(tier) ?? 0) + 1);
+    s.serviceTierHist.set(tier, (s.serviceTierHist.get(tier) ?? 0) + 1);
+  }
+  if (ev.stop_reason) {
+    ps.stopReasons.set(ev.stop_reason, (ps.stopReasons.get(ev.stop_reason) ?? 0) + 1);
+    s.stopReasonHist.set(ev.stop_reason, (s.stopReasonHist.get(ev.stop_reason) ?? 0) + 1);
+  }
+  if (ev.safety_flagged) {
+    ps.safetyFlagged++;
+    s.safetyFlagged++;
+  }
   s.total++;
   if (ev.status >= 200 && ev.status < 300) s.ok2xx++;
   else if (ev.status >= 400 && ev.status < 500) s.err4xx++;
@@ -102,17 +203,35 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     typeof ev.cache_create_tokens === 'number' ||
     typeof ev.cached_tokens === 'number' ||
     typeof ev.cache_write_tokens === 'number' ||
-    typeof ev.output_tokens === 'number';
+    typeof ev.output_tokens === 'number' ||
+    typeof ev.reasoning_tokens === 'number';
   if (hasUsage) {
     s.eventsWithUsage++;
     s.inputTokensTotal += ev.input_tokens ?? 0;
+    s.ordinaryInputTokensTotal += provider === 'openai'
+      ? Math.max(0, (ev.input_tokens ?? 0) - (ev.cached_tokens ?? 0) - (ev.cache_write_tokens ?? 0))
+      : ev.input_tokens ?? 0;
     s.outputTokensTotal += ev.output_tokens ?? 0;
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
     s.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
     s.openAICachedTokensTotal += ev.cached_tokens ?? 0;
     s.openAICacheWriteTokensTotal += ev.cache_write_tokens ?? 0;
-    if ((ev.cache_read_tokens ?? 0) > 0) s.cacheHitEvents++;
+    if ((ev.cache_read_tokens ?? 0) > 0 || (ev.cached_tokens ?? 0) > 0) s.cacheHitEvents++;
+    ps.eventsWithUsage++;
+    ps.inputTokensTotal += ev.input_tokens ?? 0;
+    ps.ordinaryInputTokensTotal += provider === 'openai'
+      ? Math.max(0, (ev.input_tokens ?? 0) - (ev.cached_tokens ?? 0) - (ev.cache_write_tokens ?? 0))
+      : ev.input_tokens ?? 0;
+    ps.outputTokensTotal += ev.output_tokens ?? 0;
+    ps.reasoningTokensTotal += ev.reasoning_tokens ?? 0;
+    ps.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
+    ps.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
+    ps.cachedTokensTotal += ev.cached_tokens ?? 0;
+    ps.cacheWriteTokensTotal += ev.cache_write_tokens ?? 0;
+    if ((ev.cache_read_tokens ?? 0) > 0 || (ev.cached_tokens ?? 0) > 0) ps.cacheHitEvents++;
   }
+  ps.imageTokensTotal += ev.image_tokens ?? 0;
+  ps.baselineImagedTokensTotal += ev.baseline_imaged_tokens ?? 0;
 
   if (ev.cwd) {
     const k = ev.cwd;
@@ -206,6 +325,28 @@ export function renderTextReport(s: Summary): string {
   );
   lines.push('');
 
+  const openai = s.byProvider.get('openai');
+  if (openai && openai.eventsWithUsage > 0) {
+    lines.push('GPT / OpenAI token telemetry (not Anthropic-priced):');
+    lines.push(`  input:         ${fmtN(openai.inputTokensTotal).padStart(12)}`);
+    lines.push(`  output:        ${fmtN(openai.outputTokensTotal).padStart(12)}`);
+    lines.push(`  reasoning:     ${fmtN(openai.reasoningTokensTotal).padStart(12)}`);
+    lines.push(`  cached read:   ${fmtN(openai.cachedTokensTotal).padStart(12)}`);
+    lines.push(`  cache writes:  ${fmtN(openai.cacheWriteTokensTotal).padStart(12)}`);
+    lines.push(`  image tokens:  ${fmtN(openai.imageTokensTotal).padStart(12)}`);
+    lines.push(`  text baseline: ${fmtN(openai.baselineImagedTokensTotal).padStart(12)}`);
+    lines.push(`  cache hit rate (by events): ${fmtPct(openai.cacheHitEvents, openai.eventsWithUsage)}`);
+    lines.push('  monetary conversion: unsupported — use provider credits/tokens');
+    lines.push('');
+  }
+
+  if (s.modelHist.size > 0) {
+    lines.push('models observed:');
+    const topModels = [...s.modelHist.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
+    for (const [model, count] of topModels) lines.push(`  ${fmtN(count).padStart(8)}  ${model}`);
+    lines.push('');
+  }
+
   if (s.skipReasons.size > 0) {
     lines.push('top skip reasons:');
     const top = [...s.skipReasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
@@ -295,7 +436,11 @@ export async function aggregateEventsFile(
  */
 export function summaryToJson(s: Summary): Record<string, unknown> {
   const topN = <K, V>(m: Map<K, V>, n = 20): [K, V][] =>
-    [...m.entries()].slice(0, n);
+    [...m.entries()].sort((a, b) => {
+      const av = typeof a[1] === 'number' ? a[1] : 0;
+      const bv = typeof b[1] === 'number' ? b[1] : 0;
+      return bv - av;
+    }).slice(0, n);
   const sortedDur = [...s.durationMs].sort((a, b) => a - b);
   const sortedFB = [...s.firstByteMs].sort((a, b) => a - b);
   return {
@@ -308,6 +453,7 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     origCharsTotal: s.origCharsTotal,
     imageBytesTotal: s.imageBytesTotal,
     inputTokensTotal: s.inputTokensTotal,
+    ordinaryInputTokensTotal: s.ordinaryInputTokensTotal,
     outputTokensTotal: s.outputTokensTotal,
     cacheCreateTokensTotal: s.cacheCreateTokensTotal,
     cacheReadTokensTotal: s.cacheReadTokensTotal,
@@ -323,5 +469,36 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     byCwd: topN(s.byCwd),
     systemShaHist: topN(s.systemShaHist),
     unknownTags: topN(s.unknownTags),
+    models: topN(s.modelHist),
+    serviceTiers: topN(s.serviceTierHist),
+    stopReasons: topN(s.stopReasonHist),
+    safetyFlagged: s.safetyFlagged,
+    byProvider: Object.fromEntries(
+      [...s.byProvider.entries()].map(([provider, p]) => [provider, {
+        provider: p.provider,
+        total: p.total,
+        ok2xx: p.ok2xx,
+        err4xx: p.err4xx,
+        err5xx: p.err5xx,
+        compressed: p.compressed,
+        passthrough: p.passthrough,
+        eventsWithUsage: p.eventsWithUsage,
+        inputTokensTotal: p.inputTokensTotal,
+        ordinaryInputTokensTotal: p.ordinaryInputTokensTotal,
+        outputTokensTotal: p.outputTokensTotal,
+        reasoningTokensTotal: p.reasoningTokensTotal,
+        cacheCreateTokensTotal: p.cacheCreateTokensTotal,
+        cacheReadTokensTotal: p.cacheReadTokensTotal,
+        cachedTokensTotal: p.cachedTokensTotal,
+        cacheWriteTokensTotal: p.cacheWriteTokensTotal,
+        imageTokensTotal: p.imageTokensTotal,
+        baselineImagedTokensTotal: p.baselineImagedTokensTotal,
+        cacheHitEvents: p.cacheHitEvents,
+        safetyFlagged: p.safetyFlagged,
+        models: topN(p.models),
+        serviceTiers: topN(p.serviceTiers),
+        stopReasons: topN(p.stopReasons),
+      }]),
+    ),
   };
 }

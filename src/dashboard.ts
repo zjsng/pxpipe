@@ -61,6 +61,7 @@ import {
   renderModelsFragment,
   renderContextMapFragment,
   renderSessionSummaryFragment,
+  renderCurrentSessionFragment,
   renderHeaderFragment,
   renderRecentFragment,
   renderLatestFragment,
@@ -73,6 +74,11 @@ import {
   getConfiguredModelBases,
   setAllowedModelBases,
 } from './core/applicability.js';
+import {
+  providerForPath,
+  serviceTierFor,
+  type ProviderId,
+} from './core/provider.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -104,6 +110,9 @@ interface ImageEntry {
    *  one render; capped upstream at 64 KiB). Lets the dashboard show the
    *  text → image pair so the operator can see what got converted. */
   sourceText?: string;
+  provider?: ProviderId;
+  model?: string;
+  serviceTier?: string;
 }
 
 /** One row in the dashboard's "recent requests" table. Compact on purpose —
@@ -123,14 +132,25 @@ export interface RecentRow {
   status: number;
   size_in?: number;
   compressed: boolean;
+  provider?: ProviderId;
+  service_tier?: string;
+  stop_reason?: string;
+  safety_flagged?: boolean;
+  sent_as?: 'image' | 'text' | 'error';
   cc_added?: number;
   input_tokens?: number;
   /** From /v1/messages `usage.output_tokens`. Identical with/without
    *  compression — shown so the operator can see why an output-heavy
    *  turn moves the headline less than a cache-create-heavy one. */
   output_tokens?: number;
+  reasoning_tokens?: number;
   cache_create?: number;
   cache_read?: number;
+  cache_write?: number;
+  cached_tokens?: number;
+  ordinary_input_tokens?: number;
+  image_tokens?: number;
+  baseline_imaged_tokens?: number;
   /** input + cache_create×1.25 + cache_read×0.10, from the upstream usage
    *  block. Missing when the request 4xx'd or wasn't /v1/messages. */
   actual_input?: number;
@@ -221,6 +241,31 @@ interface SessionTotals {
   //   1 − (rawActual + rawOutput) / (rawBaseline + rawOutput)
   // Headlining input-only would cherry-pick the part that compresses.
   rawOutputTokens: number;
+  providerTotals: Map<ProviderId, SessionProviderTotals>;
+}
+
+interface SessionProviderTotals {
+  provider: ProviderId;
+  requests: number;
+  compressedRequests: number;
+  usageRequests: number;
+  baselineMeasuredCount: number;
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  outputWeighted: number;
+  savedInputWeighted: number;
+  rawActualTokens: number;
+  rawBaselineTokens: number;
+  rawOutputTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  models: Map<string, number>;
+  serviceTiers: Map<string, number>;
 }
 
 interface Totals {
@@ -297,7 +342,45 @@ interface Totals {
   /** How many events contributed measurement counters. Lets the UI annotate
    *  the panel ("N of M events measured") when the scanner fell back. */
   eventsWithMeasurement: number;
+  providerTotals: Map<ProviderId, ProviderTotals>;
   startedAt: number;
+}
+
+interface ProviderTotals {
+  provider: ProviderId;
+  requests: number;
+  compressedRequests: number;
+  usageRequests: number;
+  baselineMeasuredCount: number;
+  actualInputWeighted: number;
+  baselineInputWeighted: number;
+  outputWeighted: number;
+  allActualInputWeighted: number;
+  allBaselineEquivalentWeighted: number;
+  allOutputWeighted: number;
+  savedInputWeighted: number;
+  compressedPaidRequests: number;
+  compressedActualInputWeighted: number;
+  compressedOutputWeighted: number;
+  passthroughPaidRequests: number;
+  passthroughActualInputWeighted: number;
+  passthroughOutputWeighted: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  anthropicCacheCreateTokens: number;
+  anthropicCacheReadTokens: number;
+  openAICachedTokens: number;
+  openAICacheWriteTokens: number;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  rawActualTokens: number;
+  rawBaselineTokens: number;
+  rawOutputTokens: number;
+  safetyFlagged: number;
+  stopReasons: Map<string, number>;
+  models: Map<string, number>;
+  serviceTiers: Map<string, number>;
 }
 
 /*
@@ -345,6 +428,102 @@ const OUTPUT_TOKEN_RATE = 5.0;
 // understates the real bill - treat it as "input-side $ saved".
 export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
 
+function newProviderTotals(provider: ProviderId): ProviderTotals {
+  return {
+    provider,
+    requests: 0,
+    compressedRequests: 0,
+    usageRequests: 0,
+    baselineMeasuredCount: 0,
+    actualInputWeighted: 0,
+    baselineInputWeighted: 0,
+    outputWeighted: 0,
+    allActualInputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
+    allOutputWeighted: 0,
+    savedInputWeighted: 0,
+    compressedPaidRequests: 0,
+    compressedActualInputWeighted: 0,
+    compressedOutputWeighted: 0,
+    passthroughPaidRequests: 0,
+    passthroughActualInputWeighted: 0,
+    passthroughOutputWeighted: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    anthropicCacheCreateTokens: 0,
+    anthropicCacheReadTokens: 0,
+    openAICachedTokens: 0,
+    openAICacheWriteTokens: 0,
+    imageTokens: 0,
+    baselineImagedTokens: 0,
+    rawActualTokens: 0,
+    rawBaselineTokens: 0,
+    rawOutputTokens: 0,
+    safetyFlagged: 0,
+    stopReasons: new Map(),
+    models: new Map(),
+    serviceTiers: new Map(),
+  };
+}
+
+function safetyStop(reason: string | undefined): boolean {
+  return reason === 'refusal'
+    || reason === 'content_filter'
+    || reason === 'safety'
+    || reason === 'safety_refusal'
+    || reason === 'blocked';
+}
+
+function isSuccessfulModelDiscovery(path: string, status: number): boolean {
+  if (status >= 400) return false;
+  const p = path.split('?', 1)[0] ?? '';
+  return p === '/models' || p === '/v1/models' || p.startsWith('/models/') || p.startsWith('/v1/models/');
+}
+
+function bump(map: Map<string, number>, key: string | undefined): void {
+  if (!key) return;
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function providerTotalsFor(
+  map: Map<ProviderId, ProviderTotals>,
+  provider: ProviderId,
+): ProviderTotals {
+  let p = map.get(provider);
+  if (!p) {
+    p = newProviderTotals(provider);
+    map.set(provider, p);
+  }
+  return p;
+}
+
+function newSessionProviderTotals(provider: ProviderId): SessionProviderTotals {
+  return {
+    provider,
+    requests: 0,
+    compressedRequests: 0,
+    usageRequests: 0,
+    baselineMeasuredCount: 0,
+    baselineInputWeighted: 0,
+    actualInputWeighted: 0,
+    outputWeighted: 0,
+    savedInputWeighted: 0,
+    rawActualTokens: 0,
+    rawBaselineTokens: 0,
+    rawOutputTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    imageTokens: 0,
+    baselineImagedTokens: 0,
+    models: new Map(),
+    serviceTiers: new Map(),
+  };
+}
+
 /** Route per-event accounting by upstream. OpenAI paths use the GPT cost
  *  model (vision-token imaging, automatic 0.1× prefix cache, no count_tokens
  *  probe, 8× output); everything else uses the Anthropic cache-aware baseline.
@@ -386,7 +565,7 @@ function gptEff(args: {
 } {
   const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached, cacheWriteTokens: written } = args;
   const { imageTokens, baselineImagedTokens, compressed } = args;
-  const haveUsage = inp > 0 || out > 0;
+  const haveUsage = inp > 0 || out > 0 || cached > 0 || written > 0;
   // The transform measured what the imaged content would have cost as o200k
   // text; without it there is no counterfactual to credit.
   const haveBaseline = baselineImagedTokens > 0;
@@ -457,6 +636,7 @@ export class DashboardState {
     toolUseCharsMeasured: 0,
     redactedBlockCountMeasured: 0,
     eventsWithMeasurement: 0,
+    providerTotals: new Map(),
     startedAt: Date.now() / 1000,
   };
   /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
@@ -516,7 +696,10 @@ export class DashboardState {
    *  Returns the assigned image ids in render order; empty array when there
    *  are no images. The caller stamps ids[0] onto the RecentRow as `img_id`
    *  for back-compat and the full list as `img_ids`. */
-  captureImage(info: NonNullable<ProxyEvent['info']>): number[] {
+  captureImage(
+    info: NonNullable<ProxyEvent['info']>,
+    meta?: { provider?: ProviderId; model?: string; serviceTier?: string },
+  ): number[] {
     const pngs = info.imagePngs ?? (info.firstImagePng ? [info.firstImagePng] : []);
     if (pngs.length === 0) return [];
     const dims =
@@ -530,15 +713,18 @@ export class DashboardState {
       const width = dims[i]?.width ?? 0;
       const height = dims[i]?.height ?? 0;
       const kb = (pngs[i]!.length / 1024).toFixed(1);
-      const meta = `${width}×${height} · ${kb} KB · image ${i + 1}/${pngs.length}`;
+      const captionMeta = `${width}×${height} · ${kb} KB · image ${i + 1}/${pngs.length}`;
       this.images.push({
         id,
         png: pngs[i]!,
-        meta,
+        meta: captionMeta,
         width,
         height,
         ts: Date.now() / 1000,
         sourceText: info.imageSourceTexts?.[i] ?? info.imageSourceText,
+        provider: meta?.provider,
+        model: meta?.model,
+        serviceTier: meta?.serviceTier,
       });
       ids.push(id);
     }
@@ -560,7 +746,11 @@ export class DashboardState {
     // Stash the image bytes before they get GC'd by the request finishing.
     // The returned id (if any) is stamped onto this request's RecentRow so
     // the dashboard can pull the exact image that request rendered.
-    const imgIds = ev.info ? this.captureImage(ev.info) : [];
+    const provider = providerForPath(ev.path, ev.model);
+    const tier = serviceTierFor(ev.model, ev.serviceTier);
+    const imgIds = ev.info
+      ? this.captureImage(ev.info, { provider, model: ev.model, serviceTier: tier })
+      : [];
     const imgId = imgIds[0];
 
     const u = ev.usage;
@@ -571,7 +761,8 @@ export class DashboardState {
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
-    const gpt = isOpenAIEvent(ev.path);
+    const gpt = provider === 'openai';
+    const safety = safetyStop(ev.stopReason);
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -605,9 +796,9 @@ export class DashboardState {
       });
       haveUsage = e.haveUsage;
       haveBaseline = e.haveBaseline;
-      creditSaving = e.creditSaving;
+      creditSaving = e.creditSaving && !safety;
       actualInputEff = e.actualInputEff;
-      baselineInputEff = e.baselineInputEff;
+      baselineInputEff = creditSaving ? e.baselineInputEff : actualInputEff;
       outputEquiv = e.outputEquiv;
       rawActual = e.rawActual;
       rawBaseline = e.rawBaseline;
@@ -642,7 +833,7 @@ export class DashboardState {
       // (which prices the prefix at the cache-READ rate) fabricates savings on
       // passthrough traffic. Only credit the counterfactual when the row was
       // actually compressed AND we have a usable probe.
-      creditSaving = haveBaseline && haveUsage && compressed;
+      creditSaving = haveBaseline && haveUsage && compressed && !safety;
 
       // Cache-aware, server-observed baseline. INVARIANT: pxpipe is credited ONLY
       // for the text it imaged away — NEVER for caching. The imagined text path
@@ -727,7 +918,7 @@ export class DashboardState {
         realInput: rawActual,
         baselineInputEff,
         actualInputEff,
-        haveBaseline,
+        haveBaseline: haveBaseline && !safety,
         cacheRead: cacheReadForRow,
         warm: warmForRow,
         output: out,
@@ -814,6 +1005,7 @@ export class DashboardState {
           rawActualTokens: 0,
           rawBaselineTokens: 0,
           rawOutputTokens: 0,
+          providerTotals: new Map(),
         };
         this.sessions.set(sid, s);
         // Cap memory — drop the first (oldest by insertion order) session
@@ -848,6 +1040,35 @@ export class DashboardState {
         s.allActualInputWeighted += actualInputEff;
         s.allOutputWeighted += outputEquiv;
       }
+      let sp = s.providerTotals.get(provider);
+      if (!sp) {
+        sp = newSessionProviderTotals(provider);
+        s.providerTotals.set(provider, sp);
+      }
+      sp.requests += 1;
+      if (compressed) sp.compressedRequests += 1;
+      if (haveUsage) {
+        sp.usageRequests += 1;
+        sp.inputTokens += inp;
+        sp.outputTokens += out;
+        sp.reasoningTokens += u?.reasoning_tokens ?? 0;
+        sp.actualInputWeighted += actualInputEff;
+        sp.outputWeighted += outputEquiv;
+        sp.cacheReadTokens += provider === 'openai' ? (u?.cached_tokens ?? 0) : cr;
+        sp.cacheWriteTokens += provider === 'openai' ? (u?.cache_write_tokens ?? 0) : cc;
+      }
+      sp.imageTokens += info?.imageTokens ?? 0;
+      sp.baselineImagedTokens += info?.baselineImagedTokens ?? 0;
+      bump(sp.models, ev.model);
+      bump(sp.serviceTiers, tier);
+      if (creditSaving) {
+        sp.baselineMeasuredCount += 1;
+        sp.baselineInputWeighted += baselineInputEff;
+        sp.savedInputWeighted += baselineInputEff - actualInputEff;
+        sp.rawActualTokens += rawActual;
+        sp.rawBaselineTokens += rawBaseline;
+        sp.rawOutputTokens += out;
+      }
     }
 
     // Measurement totals are independent of usage/baseline gating — they
@@ -863,6 +1084,54 @@ export class DashboardState {
       this.totals.eventsWithMeasurement += 1;
     }
 
+    // Provider bucket used by the dashboard's honest split. The legacy global
+    // totals below remain for compatibility, but this is the source for any
+    // provider-labelled metric and keeps GPT credits out of Claude USD.
+    const pt = providerTotalsFor(this.totals.providerTotals, provider);
+    pt.requests += 1;
+    if (compressed) pt.compressedRequests += 1;
+    if (haveUsage) {
+      pt.usageRequests += 1;
+      pt.inputTokens += inp;
+      pt.outputTokens += out;
+      pt.reasoningTokens += u?.reasoning_tokens ?? 0;
+      pt.allActualInputWeighted += actualInputEff;
+      pt.allBaselineEquivalentWeighted += baselineInputEff;
+      pt.allOutputWeighted += outputEquiv;
+      if (compressed) {
+        pt.compressedPaidRequests += 1;
+        pt.compressedActualInputWeighted += actualInputEff;
+        pt.compressedOutputWeighted += outputEquiv;
+      } else {
+        pt.passthroughPaidRequests += 1;
+        pt.passthroughActualInputWeighted += actualInputEff;
+        pt.passthroughOutputWeighted += outputEquiv;
+      }
+    }
+    if (provider === 'openai') {
+      pt.openAICachedTokens += u?.cached_tokens ?? 0;
+      pt.openAICacheWriteTokens += u?.cache_write_tokens ?? 0;
+    } else if (provider === 'anthropic') {
+      pt.anthropicCacheCreateTokens += cc;
+      pt.anthropicCacheReadTokens += cr;
+    }
+    pt.imageTokens += info?.imageTokens ?? 0;
+    pt.baselineImagedTokens += info?.baselineImagedTokens ?? 0;
+    if (safety) pt.safetyFlagged += 1;
+    bump(pt.stopReasons, ev.stopReason);
+    bump(pt.models, ev.model);
+    bump(pt.serviceTiers, tier);
+    if (creditSaving) {
+      pt.baselineMeasuredCount += 1;
+      pt.baselineInputWeighted += baselineInputEff;
+      pt.actualInputWeighted += actualInputEff;
+      pt.outputWeighted += outputEquiv;
+      pt.savedInputWeighted += baselineInputEff - actualInputEff;
+      pt.rawActualTokens += rawActual;
+      pt.rawBaselineTokens += rawBaseline;
+      pt.rawOutputTokens += out;
+    }
+
     const row: RecentRow = {
       ts: Date.now() / 1000,
       method: ev.method,
@@ -870,11 +1139,25 @@ export class DashboardState {
       model: ev.model,
       status: ev.status,
       compressed,
+      provider,
+      service_tier: tier,
+      stop_reason: ev.stopReason,
+      safety_flagged: safety || undefined,
+      sent_as: ev.status >= 400 ? 'error' : compressed ? 'image' : 'text',
       cc_added: compressed ? 1 : undefined,
       input_tokens: haveUsage ? inp : undefined,
       output_tokens: haveUsage ? out : undefined,
+      reasoning_tokens: haveUsage ? u?.reasoning_tokens : undefined,
       cache_create: haveUsage ? cc : undefined,
-      cache_read: haveUsage ? cacheReadForRow : undefined,
+      cache_read: haveUsage ? (provider === 'openai' ? u?.cached_tokens : cr) : undefined,
+      cache_write: provider === 'openai' && haveUsage ? u?.cache_write_tokens : undefined,
+      cached_tokens: provider === 'openai' && haveUsage ? u?.cached_tokens : undefined,
+      ordinary_input_tokens: provider === 'openai' && haveUsage
+        && (u?.cached_tokens !== undefined || u?.cache_write_tokens !== undefined)
+        ? Math.max(0, inp - (u?.cached_tokens ?? 0) - (u?.cache_write_tokens ?? 0))
+        : undefined,
+      image_tokens: provider === 'openai' ? info?.imageTokens : undefined,
+      baseline_imaged_tokens: provider === 'openai' ? info?.baselineImagedTokens : undefined,
       actual_input: haveUsage ? round1(actualInputEff) : undefined,
       baseline_input: creditSaving ? round1(baselineInputEff) : undefined,
       session_saved_so_far_delta:
@@ -882,8 +1165,13 @@ export class DashboardState {
       img_id: imgId,
       img_ids: imgIds,
     };
-    this.recent.push(row);
-    if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
+    // Successful discovery polls are high-volume and carry no generation
+    // context. Keep failed discovery calls (they are useful diagnostics), but
+    // do not let a healthy client's repeated /models traffic evict useful rows.
+    if (!isSuccessfulModelDiscovery(ev.path, ev.status)) {
+      this.recent.push(row);
+      if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
+    }
   }
 
 
@@ -899,26 +1187,31 @@ export class DashboardState {
     }
     const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    const tail: TrackEvent[] = [];
+    // Keep the parsed rows so the accounting/session state is restored from the
+    // full log, not just the visible recent ring. A single rotated log is
+    // bounded by FileTracker (~100 MB) and this is startup-only work.
+    const events: TrackEvent[] = [];
     for await (const line of rl) {
       if (!line) continue;
       try {
         const ev = JSON.parse(line) as TrackEvent;
-        tail.push(ev);
-        if (tail.length > RECENT_CAP) tail.shift();
+        events.push(ev);
       } catch {
         /* skip malformed line */
       }
     }
     // Replay mirrors the live update() warmth logic (per-session baselineWarmth,
     // cr-grounded) so it produces byte-identical per-row numbers to update().
-    for (const t of tail) {
+    for (const t of events) {
       const inp = t.input_tokens ?? 0;
       const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
-      const gpt = isOpenAIEvent(t.path);
+      const provider = providerForPath(t.path, t.model);
+      const tier = serviceTierFor(t.model, t.service_tier);
+      const safety = t.safety_flagged === true || safetyStop(t.stop_reason);
+      const gpt = provider === 'openai';
 
       // Same unified accounting as update(); see the branch comments there.
       let haveUsage: boolean;
@@ -926,6 +1219,7 @@ export class DashboardState {
       let creditSaving: boolean;
       let actualInputEff: number;
       let baselineInputEff: number;
+      let outputEquiv: number;
       let rawActual: number;
       let rawBaseline: number;
       let baselineForRow: number;
@@ -938,7 +1232,7 @@ export class DashboardState {
           inputTokens: inp,
           outputTokens: out,
           cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
-          cacheWriteTokens: (t as { cache_write_tokens?: number }).cache_write_tokens ?? 0,
+          cacheWriteTokens: t.cache_write_tokens ?? 0,
           imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
           baselineImagedTokens:
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
@@ -946,16 +1240,17 @@ export class DashboardState {
         });
         haveUsage = e.haveUsage;
         haveBaseline = e.haveBaseline;
-        creditSaving = e.creditSaving;
+        creditSaving = e.creditSaving && !safety;
         actualInputEff = e.actualInputEff;
-        baselineInputEff = e.baselineInputEff;
+        baselineInputEff = creditSaving ? e.baselineInputEff : actualInputEff;
+        outputEquiv = e.outputEquiv;
         rawActual = e.rawActual;
         rawBaseline = e.rawBaseline;
         baselineForRow = e.rawBaseline;
         cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
         warmForRow = ((t as { cached_tokens?: number }).cached_tokens ?? 0) > 0;
       } else {
-        haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
+        haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0 || (t.reasoning_tokens ?? 0) > 0;
         const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
         const cacheable = (t as { baseline_cacheable_tokens?: number })
           .baseline_cacheable_tokens ?? 0;
@@ -966,10 +1261,11 @@ export class DashboardState {
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
         actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+        outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
         // actual cost so they show zero saved (no fabricated savings).
-        creditSaving = haveBaseline && haveUsage && compressed;
+        creditSaving = haveBaseline && haveUsage && compressed && !safety;
         // Warm/cold is reconstructed from server-observed cr only. Persisted
         // completion ts + duration_ms are used only to find a prior prefix size
         // for the reused/grown split after cr>0 has proved warmth.
@@ -1031,7 +1327,7 @@ export class DashboardState {
           realInput: rawActual,
           baselineInputEff,
           actualInputEff,
-          haveBaseline,
+          haveBaseline: haveBaseline && !safety,
           cacheRead: cacheReadForRow,
           warm: warmForRow,
           output: out,
@@ -1051,6 +1347,154 @@ export class DashboardState {
           this.contextHistory.splice(0, this.contextHistory.length - RECENT_CAP);
         }
       }
+
+      // Restore the same lifetime/provider/session accumulators as update().
+      // Unlike PNGs, token telemetry is persisted and remains useful after a
+      // restart; this makes /api/current-session.json and /proxy-stats honest
+      // immediately after launch.
+      this.totals.requests += 1;
+      if (compressed) this.totals.compressedRequests += 1;
+      if (creditSaving) {
+        this.totals.baselineInputWeighted += baselineInputEff;
+        this.totals.actualInputWeighted += actualInputEff;
+        this.totals.outputWeighted += outputEquiv;
+      }
+      if (haveUsage) {
+        this.totals.allBaselineEquivalentWeighted += baselineInputEff;
+        this.totals.allActualInputWeighted += actualInputEff;
+        this.totals.allOutputWeighted += outputEquiv;
+        this.totals.allUsageRequests += 1;
+        if (compressed) {
+          this.totals.compressedPaidRequests += 1;
+          this.totals.compressedActualInputWeighted += actualInputEff;
+          this.totals.compressedOutputWeighted += outputEquiv;
+        } else {
+          this.totals.passthroughPaidRequests += 1;
+          this.totals.passthroughActualInputWeighted += actualInputEff;
+          this.totals.passthroughOutputWeighted += outputEquiv;
+        }
+      }
+      this.totals.textCharsMeasured += t.text_chars_measured ?? 0;
+      this.totals.thinkingCharsMeasured += t.thinking_chars_measured ?? 0;
+      this.totals.toolUseCharsMeasured += t.tool_use_chars_measured ?? 0;
+      this.totals.redactedBlockCountMeasured += t.redacted_block_count_measured ?? 0;
+      if (
+        (t.text_chars_measured ?? 0) > 0
+        || (t.thinking_chars_measured ?? 0) > 0
+        || (t.tool_use_chars_measured ?? 0) > 0
+        || (t.redacted_block_count_measured ?? 0) > 0
+      ) this.totals.eventsWithMeasurement += 1;
+
+      const pt = providerTotalsFor(this.totals.providerTotals, provider);
+      pt.requests += 1;
+      if (compressed) pt.compressedRequests += 1;
+      if (haveUsage) {
+        pt.usageRequests += 1;
+        pt.inputTokens += inp;
+        pt.outputTokens += out;
+        pt.reasoningTokens += t.reasoning_tokens ?? 0;
+        pt.allActualInputWeighted += actualInputEff;
+        pt.allBaselineEquivalentWeighted += baselineInputEff;
+        pt.allOutputWeighted += outputEquiv;
+        if (compressed) {
+          pt.compressedPaidRequests += 1;
+          pt.compressedActualInputWeighted += actualInputEff;
+          pt.compressedOutputWeighted += outputEquiv;
+        } else {
+          pt.passthroughPaidRequests += 1;
+          pt.passthroughActualInputWeighted += actualInputEff;
+          pt.passthroughOutputWeighted += outputEquiv;
+        }
+      }
+      if (provider === 'openai') {
+        pt.openAICachedTokens += t.cached_tokens ?? 0;
+        pt.openAICacheWriteTokens += t.cache_write_tokens ?? 0;
+      } else if (provider === 'anthropic') {
+        pt.anthropicCacheCreateTokens += cc;
+        pt.anthropicCacheReadTokens += cr;
+      }
+      pt.imageTokens += t.image_tokens ?? 0;
+      pt.baselineImagedTokens += t.baseline_imaged_tokens ?? 0;
+      if (safety) pt.safetyFlagged += 1;
+      bump(pt.stopReasons, t.stop_reason);
+      bump(pt.models, t.model);
+      bump(pt.serviceTiers, tier);
+      if (creditSaving) {
+        pt.baselineMeasuredCount += 1;
+        pt.baselineInputWeighted += baselineInputEff;
+        pt.actualInputWeighted += actualInputEff;
+        pt.outputWeighted += outputEquiv;
+        pt.savedInputWeighted += baselineInputEff - actualInputEff;
+        pt.rawActualTokens += rawActual;
+        pt.rawBaselineTokens += rawBaseline;
+        pt.rawOutputTokens += out;
+      }
+
+      const sid = t.first_user_sha8;
+      if (sid) {
+        this.currentSessionId = sid;
+        let s = this.sessions.get(sid);
+        if (!s) {
+          s = {
+            sessionId: sid,
+            baselineInputWeighted: 0,
+            actualInputWeighted: 0,
+            baselineMeasuredCount: 0,
+            allActualInputWeighted: 0,
+            allOutputWeighted: 0,
+            rawActualTokens: 0,
+            rawBaselineTokens: 0,
+            rawOutputTokens: 0,
+            providerTotals: new Map(),
+          };
+          this.sessions.set(sid, s);
+          if (this.sessions.size > DashboardState.SESSION_CAP) {
+            const firstKey = this.sessions.keys().next().value;
+            if (firstKey !== undefined) this.sessions.delete(firstKey);
+          }
+        }
+        if (creditSaving) {
+          s.baselineInputWeighted += baselineInputEff;
+          s.actualInputWeighted += actualInputEff;
+          s.baselineMeasuredCount += 1;
+          s.rawActualTokens += rawActual;
+          s.rawBaselineTokens += rawBaseline;
+          s.rawOutputTokens += out;
+        }
+        if (haveUsage) {
+          s.allActualInputWeighted += actualInputEff;
+          s.allOutputWeighted += outputEquiv;
+        }
+        let sp = s.providerTotals.get(provider);
+        if (!sp) {
+          sp = newSessionProviderTotals(provider);
+          s.providerTotals.set(provider, sp);
+        }
+        sp.requests += 1;
+        if (compressed) sp.compressedRequests += 1;
+        if (haveUsage) {
+          sp.usageRequests += 1;
+          sp.inputTokens += inp;
+          sp.outputTokens += out;
+          sp.reasoningTokens += t.reasoning_tokens ?? 0;
+          sp.actualInputWeighted += actualInputEff;
+          sp.outputWeighted += outputEquiv;
+          sp.cacheReadTokens += provider === 'openai' ? (t.cached_tokens ?? 0) : cr;
+          sp.cacheWriteTokens += provider === 'openai' ? (t.cache_write_tokens ?? 0) : cc;
+        }
+        sp.imageTokens += t.image_tokens ?? 0;
+        sp.baselineImagedTokens += t.baseline_imaged_tokens ?? 0;
+        bump(sp.models, t.model);
+        bump(sp.serviceTiers, tier);
+        if (creditSaving) {
+          sp.baselineMeasuredCount += 1;
+          sp.baselineInputWeighted += baselineInputEff;
+          sp.savedInputWeighted += baselineInputEff - actualInputEff;
+          sp.rawActualTokens += rawActual;
+          sp.rawBaselineTokens += rawBaseline;
+          sp.rawOutputTokens += out;
+        }
+      }
       const row: RecentRow = {
         ts: Date.parse(t.ts) / 1000,
         method: t.method,
@@ -1058,11 +1502,25 @@ export class DashboardState {
         model: t.model,
         status: t.status,
         compressed,
+        provider,
+        service_tier: tier,
+        stop_reason: t.stop_reason,
+        safety_flagged: safety || undefined,
+        sent_as: t.status >= 400 ? 'error' : compressed ? 'image' : 'text',
         cc_added: compressed ? 1 : undefined,
         input_tokens: t.input_tokens,
         output_tokens: t.output_tokens,
+        reasoning_tokens: t.reasoning_tokens,
         cache_create: t.cache_create_tokens,
-        cache_read: gpt ? cacheReadForRow : t.cache_read_tokens,
+        cache_read: gpt ? t.cached_tokens : t.cache_read_tokens,
+        cache_write: gpt ? t.cache_write_tokens : undefined,
+        cached_tokens: gpt ? t.cached_tokens : undefined,
+        ordinary_input_tokens: gpt
+          && (t.cached_tokens !== undefined || t.cache_write_tokens !== undefined)
+          ? Math.max(0, inp - (t.cached_tokens ?? 0) - (t.cache_write_tokens ?? 0))
+          : undefined,
+        image_tokens: gpt ? (t.image_tokens ?? 0) : undefined,
+        baseline_imaged_tokens: gpt ? (t.baseline_imaged_tokens ?? 0) : undefined,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
         baseline_input:
           creditSaving ? round1(baselineInputEff) : undefined,
@@ -1071,7 +1529,10 @@ export class DashboardState {
         img_id: imgId,
         img_ids: imgId !== undefined ? [imgId] : undefined,
       };
-      this.recent.push(row);
+      if (!isSuccessfulModelDiscovery(t.path, t.status)) {
+        this.recent.push(row);
+        if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
+      }
     }
   }
 
@@ -1122,6 +1583,31 @@ export class DashboardState {
       rawActualTokens: s.rawActualTokens,
       rawBaselineTokens: s.rawBaselineTokens,
       rawOutputTokens: s.rawOutputTokens,
+      providers: Object.fromEntries(
+        [...s.providerTotals.entries()].map(([provider, p]) => [provider, {
+          provider: p.provider,
+          requests: p.requests,
+          compressedRequests: p.compressedRequests,
+          usageRequests: p.usageRequests,
+          baselineMeasuredCount: p.baselineMeasuredCount,
+          baselineInputWeighted: p.baselineInputWeighted,
+          actualInputWeighted: p.actualInputWeighted,
+          outputWeighted: p.outputWeighted,
+          savedInputWeighted: p.savedInputWeighted,
+          rawActualTokens: p.rawActualTokens,
+          rawBaselineTokens: p.rawBaselineTokens,
+          rawOutputTokens: p.rawOutputTokens,
+          inputTokens: p.inputTokens,
+          outputTokens: p.outputTokens,
+          reasoningTokens: p.reasoningTokens,
+          cacheReadTokens: p.cacheReadTokens,
+          cacheWriteTokens: p.cacheWriteTokens,
+          imageTokens: p.imageTokens,
+          baselineImagedTokens: p.baselineImagedTokens,
+          models: [...p.models.entries()],
+          serviceTiers: [...p.serviceTiers.entries()],
+        }]),
+      ),
     });
   }
 
@@ -1177,23 +1663,25 @@ export class DashboardState {
     // the rate assumption cancels in the delta. Selection bias from the
     // gate is NOT cancelled — the operator interprets that via the
     // sample-count caveat below.
+    // Monetary figures are intentionally Anthropic-only. GPT/Codex usage is
+    // exposed below as provider credits; applying the Claude rate to it was a
+    // misleading live-dashboard bug.
+    const anthropic = this.totals.providerTotals.get('anthropic') ?? newProviderTotals('anthropic');
     const compressedTokenEquiv =
-      this.totals.compressedActualInputWeighted +
-      this.totals.compressedOutputWeighted;
+      anthropic.compressedActualInputWeighted + anthropic.compressedOutputWeighted;
     const passthroughTokenEquiv =
-      this.totals.passthroughActualInputWeighted +
-      this.totals.passthroughOutputWeighted;
+      anthropic.passthroughActualInputWeighted + anthropic.passthroughOutputWeighted;
     const compressedActualUsd =
       (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
     const passthroughActualUsd =
       (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
     const compressedAvgUsd =
-      this.totals.compressedPaidRequests > 0
-        ? compressedActualUsd / this.totals.compressedPaidRequests
+      anthropic.compressedPaidRequests > 0
+        ? compressedActualUsd / anthropic.compressedPaidRequests
         : 0;
     const passthroughAvgUsd =
-      this.totals.passthroughPaidRequests > 0
-        ? passthroughActualUsd / this.totals.passthroughPaidRequests
+      anthropic.passthroughPaidRequests > 0
+        ? passthroughActualUsd / anthropic.passthroughPaidRequests
         : 0;
     // Sufficient-sample threshold is a soft heuristic. 20 paid requests per
     // bucket is enough to see a real effect on Opus 4.7 traffic (a single
@@ -1201,9 +1689,63 @@ export class DashboardState {
     // bucket numbers but hides the delta and surfaces "small sample".
     const SUFFICIENT = 20;
     const splitSufficient =
-      this.totals.compressedPaidRequests >= SUFFICIENT &&
-      this.totals.passthroughPaidRequests >= SUFFICIENT;
+      anthropic.compressedPaidRequests >= SUFFICIENT &&
+      anthropic.passthroughPaidRequests >= SUFFICIENT;
     const splitDeltaUsd = compressedAvgUsd - passthroughAvgUsd;
+
+    const providerPayload = (p: ProviderTotals) => {
+      const pct = p.baselineInputWeighted > 0
+        ? (p.savedInputWeighted / p.baselineInputWeighted) * 100
+        : 0;
+      const cAvg = p.compressedPaidRequests > 0
+        ? p.compressedActualInputWeighted / p.compressedPaidRequests
+        : 0;
+      const passAvg = p.passthroughPaidRequests > 0
+        ? p.passthroughActualInputWeighted / p.passthroughPaidRequests
+        : 0;
+      return {
+        provider: p.provider,
+        requests: p.requests,
+        compressed_requests: p.compressedRequests,
+        usage_requests: p.usageRequests,
+        baseline_measured_count: p.baselineMeasuredCount,
+        baseline_input_weighted: Math.round(p.baselineInputWeighted),
+        actual_input_weighted: Math.round(p.actualInputWeighted),
+        output_weighted: Math.round(p.outputWeighted),
+        all_baseline_equivalent_weighted: Math.round(p.allBaselineEquivalentWeighted),
+        all_actual_input_weighted: Math.round(p.allActualInputWeighted),
+        all_output_weighted: Math.round(p.allOutputWeighted),
+        saved_input_weighted: Math.round(p.savedInputWeighted),
+        saved_pct_input_only: round1(pct),
+        compressed_paid_requests: p.compressedPaidRequests,
+        passthrough_paid_requests: p.passthroughPaidRequests,
+        compressed_avg_input_weighted: round1(cAvg),
+        passthrough_avg_input_weighted: round1(passAvg),
+        input_tokens: p.inputTokens,
+        output_tokens: p.outputTokens,
+        reasoning_tokens: p.reasoningTokens,
+        anthropic_cache_create_tokens: p.anthropicCacheCreateTokens,
+        anthropic_cache_read_tokens: p.anthropicCacheReadTokens,
+        openai_cached_tokens: p.openAICachedTokens,
+        openai_cache_write_tokens: p.openAICacheWriteTokens,
+        image_tokens: p.imageTokens,
+        baseline_imaged_tokens: p.baselineImagedTokens,
+        raw_actual_tokens: p.rawActualTokens,
+        raw_baseline_tokens: p.rawBaselineTokens,
+        raw_output_tokens: p.rawOutputTokens,
+        safety_flagged: p.safetyFlagged,
+        models: [...p.models.entries()],
+        service_tiers: [...p.serviceTiers.entries()],
+        stop_reasons: [...p.stopReasons.entries()],
+        monetary_supported: p.provider === 'anthropic',
+        ...(p.provider === 'anthropic'
+          ? { saved_usd: round4((p.savedInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6) }
+          : {}),
+      };
+    };
+    const providers = Object.fromEntries(
+      [...this.totals.providerTotals.entries()].map(([id, p]) => [id, providerPayload(p)]),
+    );
 
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
@@ -1231,8 +1773,8 @@ export class DashboardState {
       // headline. Total actual $ and average $/req per path, plus a delta
       // gated on `split_sufficient_sample`. No counterfactual: each
       // bucket is what each path actually billed.
-      compressed_paid_requests: this.totals.compressedPaidRequests,
-      passthrough_paid_requests: this.totals.passthroughPaidRequests,
+      compressed_paid_requests: anthropic.compressedPaidRequests,
+      passthrough_paid_requests: anthropic.passthroughPaidRequests,
       compressed_actual_usd: round4(compressedActualUsd),
       passthrough_actual_usd: round4(passthroughActualUsd),
       compressed_avg_usd_per_request: round4(compressedAvgUsd),
@@ -1240,7 +1782,9 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      // Back-compat field: Claude-only dollars. A GPT-only run returns zero and
+      // the provider bucket explicitly says monetary_supported=false.
+      saved_usd: round4((anthropic.savedInputWeighted * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
@@ -1266,6 +1810,33 @@ export class DashboardState {
       events_with_measurement: this.totals.eventsWithMeasurement,
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
+      reasoning_tokens: [...this.totals.providerTotals.values()]
+        .reduce((n, p) => n + p.reasoningTokens, 0),
+      safety_flagged: [...this.totals.providerTotals.values()]
+        .reduce((n, p) => n + p.safetyFlagged, 0),
+      providers,
+      pricing_by_provider: {
+        anthropic: {
+          monetary_supported: true,
+          unit: 'Anthropic input-token equivalents',
+          input_per_mtok: ASSUMED_INPUT_USD_PER_MTOK,
+          output_multiplier: OUTPUT_TOKEN_RATE,
+          cache_read_multiplier: 0.1,
+          cache_write_multiplier: 1.25,
+          source: 'docs.anthropic.com/en/docs/about-claude/pricing (verified 2026-05-19)',
+        },
+        openai: {
+          monetary_supported: false,
+          unit: 'GPT provider input-credit equivalents (ordinary=1, cached≈0.1, write≈1.25; output≈8)',
+          cache_read_multiplier: 0.1,
+          cache_write_multiplier: 1.25,
+          source: 'OpenAI usage telemetry; exact Codex subscription pricing unavailable',
+        },
+        other: {
+          monetary_supported: false,
+          unit: 'unpriced provider telemetry',
+        },
+      },
     };
     return new Response(JSON.stringify(payload, null, 2), {
       headers: { 'content-type': 'application/json' },
@@ -1278,6 +1849,9 @@ export class DashboardState {
       recent: this.recent,
       has_preview: latest !== undefined,
       preview_meta: latest?.meta ?? '',
+      preview_provider: latest?.provider,
+      preview_model: latest?.model,
+      preview_service_tier: latest?.serviceTier,
       // Image ids currently resident in the ring. The dashboard uses this to
       // tell which RecentRow.img_id values still resolve — older ones have
       // been evicted and their "view" button should be disabled.
@@ -1366,6 +1940,10 @@ export class DashboardState {
         const s = (await this.serveStats().json()) as StatsPayload;
         return htmlResponse(renderSessionSummaryFragment(s));
       }
+      case 'current-session': {
+        const p = (await this.serveCurrentSessionJson().json()) as CurrentSessionPayload;
+        return htmlResponse(renderCurrentSessionFragment(p));
+      }
       case 'header': {
         const s = (await this.serveStats().json()) as StatsPayload;
         return htmlResponse(renderHeaderFragment(s, port));
@@ -1381,6 +1959,9 @@ export class DashboardState {
         const pin = Number.isFinite(pinNum) ? pinNum : null;
         const showSource = url.searchParams.get('source') === '1';
         let sourceText: string | null = null;
+        let imageProvider: ProviderId | undefined;
+        let imageModel: string | undefined;
+        let imageTier: string | undefined;
         if (showSource) {
           const entry =
             pin != null
@@ -1388,7 +1969,21 @@ export class DashboardState {
               : this.images[this.images.length - 1];
           sourceText = entry?.sourceText ?? null;
         }
-        return htmlResponse(renderLatestFragment({ payload: r, pin, showSource, sourceText }));
+        const selected = pin != null
+          ? this.images.find((im) => im.id === pin)
+          : this.images[this.images.length - 1];
+        imageProvider = selected?.provider;
+        imageModel = selected?.model;
+        imageTier = selected?.serviceTier;
+        return htmlResponse(renderLatestFragment({
+          payload: r,
+          pin,
+          showSource,
+          sourceText,
+          provider: imageProvider,
+          model: imageModel,
+          serviceTier: imageTier,
+        }));
       }
       case 'sessions': {
         const res = await this.serveSessionsJson();

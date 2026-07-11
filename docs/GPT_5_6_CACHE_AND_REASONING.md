@@ -91,6 +91,11 @@ Codex CLI 0.144.1 was observed doing exactly that: its request used
 `reasoning.context: "all_turns"`. Since the caller already selected the mode,
 pxpipe leaves it intact.
 
+The same live transport also supplies its own `prompt_cache_key`. A July 2026
+`codex exec` smoke test through pxpipe succeeded with that native key while the
+public-only `prompt_cache_options` and breakpoint fields were absent. pxpipe
+records only a non-reversible fingerprint of the key, never the raw value.
+
 Use `all_turns` for a stable multi-turn task. Leave the option off, or have the
 caller set `current_turn`, when the goal changes or earlier analysis is no longer
 relevant.
@@ -103,9 +108,39 @@ JSONL events expose:
 - `gpt_persisted_reasoning`
 - `gpt_reasoning_items`
 - `gpt_encrypted_reasoning_items`
+- `gpt_reasoning_bytes`
+- `gpt_encrypted_reasoning_bytes`
+- `gpt_reasoning_effort`
+- `gpt_reasoning_context`
+- `gpt_prompt_cache_key_present`
+- `gpt_prompt_cache_key_fingerprint`
+- `request_body_input_bytes`
+- `request_body_output_bytes`
+- `gpt_render_cache_hits`
+- `gpt_render_cache_misses`
+- `gpt_render_cache_saved_ms`
 - `cached_tokens`
 - `cache_write_tokens`
 
 A useful evaluation compares price-weighted input, output/reasoning tokens,
 latency, and task quality across matched workflows. Lower raw input alone is not
 enough if persisted context increases output work or changes task success.
+
+## Local render cache
+
+OpenAI prompt caching avoids repeated model-side prefix work. It does not avoid
+pxpipe's own PNG generation. GPT frozen-history sections and the static slab are
+deterministic, so pxpipe keeps their rendered pages in a process-local 64 MiB
+LRU keyed by the full text and render geometry. In-flight requests share the
+same render promise. A restart clears the cache; correctness never depends on a
+hit.
+
+On the first live request after deployment, 13 pages rendered in 1,076 ms. The
+next same-prefix requests hit all 13 cached sections and transformed in 277–308
+ms, avoiding about 0.75–0.80 seconds of local work per request.
+
+`eval/benchmark-gpt-history-sections.ts` tests the frozen-section sizing against
+a 75-turn, roughly 77k-token, tool-heavy transcript. The 2k and 4k settings were
+identical; 6k increased physical images; 8k left a partial tail uncollapsed; and
+12k reduced image tokens by only about 1%. The production 2k default therefore
+remains unchanged.

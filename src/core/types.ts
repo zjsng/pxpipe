@@ -78,6 +78,10 @@ export interface Usage {
   cached_tokens?: number;
   /** GPT-5.6+ prompt tokens written to cache, a subset of input_tokens. */
   cache_write_tokens?: number;
+  /** OpenAI reasoning tokens, normally nested in output token details. */
+  reasoning_tokens?: number;
+  /** Provider-reported service tier when present. */
+  service_tier?: string;
 }
 
 export interface MessagesRequest {

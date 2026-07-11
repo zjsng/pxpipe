@@ -59,6 +59,9 @@ export interface ProxyEvent {
    *  output and would otherwise look "cheaper"). OpenAI finish_reason ("stop",
    *  "length", "content_filter", …) is normalized into the same field. */
   stopReason?: string;
+  /** Provider-reported service tier; model suffix is used as a fallback by
+   * telemetry consumers when the upstream omits it. */
+  serviceTier?: string;
   error?: string;
   /** First ~2 KiB of the upstream 4xx body (not captured on 2xx or 5xx). */
   errorBody?: string;
@@ -123,7 +126,12 @@ export interface OutputMeasurement {
 function processSseEvent(
   block: string,
   m: OutputMeasurement,
-  state: { usage: Usage | undefined; stopReason: string | undefined; model: string | undefined },
+  state: {
+    usage: Usage | undefined;
+    stopReason: string | undefined;
+    model: string | undefined;
+    serviceTier: string | undefined;
+  },
 ): void {
   // Parse `event:` + `data:` lines; continuation data: lines concatenate per SSE spec.
   let event = '';
@@ -145,10 +153,14 @@ function processSseEvent(
   // alias. Codex can route the GPT 5.6 class to Sol, Terra, or Luna and reports
   // that tier on the response object. Keeping only the request model made
   // non-Sol traffic indistinguishable in dashboard telemetry.
-  const response = obj.response as { model?: unknown } | undefined;
+  const response = obj.response as { model?: unknown; service_tier?: unknown } | undefined;
   const reportedModel = response?.model ?? obj.model;
   if (typeof reportedModel === 'string' && reportedModel.length > 0) {
     state.model = reportedModel;
+  }
+  const reportedTier = response?.service_tier ?? obj.service_tier;
+  if (typeof reportedTier === 'string' && reportedTier.length > 0) {
+    state.serviceTier = reportedTier;
   }
 
   // The public Responses API normally sends an explicit SSE `event:` line,
@@ -260,6 +272,12 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   if (details && typeof details.cache_write_tokens === 'number') {
     out.cache_write_tokens = details.cache_write_tokens;
   }
+  const outputDetails =
+    (u.output_tokens_details as Record<string, unknown> | undefined) ??
+    (u.completion_tokens_details as Record<string, unknown> | undefined);
+  const reasoning = outputDetails?.reasoning_tokens ?? u.reasoning_tokens;
+  if (typeof reasoning === 'number') out.reasoning_tokens = reasoning;
+  if (typeof u.service_tier === 'string') out.service_tier = u.service_tier;
 
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -330,6 +348,19 @@ function readStopReasonFromJson(j: unknown): string | undefined {
     const reason = obj.incomplete_details?.reason;
     return typeof reason === 'string' ? reason : 'incomplete';
   }
+  const output = (j as { output?: unknown }).output;
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      if (!item || typeof item !== 'object') continue;
+      const o = item as { status?: unknown; type?: unknown; content?: unknown };
+      if (o.status === 'incomplete') return 'incomplete';
+      if (o.type === 'message' && Array.isArray(o.content)) {
+        if (o.content.some((part) => (part as { type?: unknown } | undefined)?.type === 'refusal')) {
+          return 'refusal';
+        }
+      }
+    }
+  }
   return undefined;
 }
 
@@ -345,6 +376,7 @@ function teeForUsage(res: Response): {
   measurementPromise: Promise<OutputMeasurement | undefined>;
   stopReasonPromise: Promise<string | undefined>;
   modelPromise: Promise<string | undefined>;
+  serviceTierPromise: Promise<string | undefined>;
 } {
   // No body at all: nothing to extract on either path.
   if (!res.body) {
@@ -355,6 +387,7 @@ function teeForUsage(res: Response): {
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
       modelPromise: Promise.resolve(undefined),
+      serviceTierPromise: Promise.resolve(undefined),
     };
   }
   // 4xx: tee for the error body but skip usage scanning entirely.
@@ -392,6 +425,7 @@ function teeForUsage(res: Response): {
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
       modelPromise: Promise.resolve(undefined),
+      serviceTierPromise: Promise.resolve(undefined),
     };
   }
   // 5xx: skip both (the host already synthesizes an error message).
@@ -403,6 +437,7 @@ function teeForUsage(res: Response): {
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
       modelPromise: Promise.resolve(undefined),
+      serviceTierPromise: Promise.resolve(undefined),
     };
   }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -414,6 +449,7 @@ function teeForUsage(res: Response): {
     measurement: OutputMeasurement | undefined;
     stopReason: string | undefined;
     model: string | undefined;
+    serviceTier: string | undefined;
   }> => {
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
@@ -433,10 +469,16 @@ function teeForUsage(res: Response): {
           toolUseChars: 0,
           redactedBlockCount: 0,
         };
-        const state: { usage: Usage | undefined; stopReason: string | undefined; model: string | undefined } = {
+        const state: {
+          usage: Usage | undefined;
+          stopReason: string | undefined;
+          model: string | undefined;
+          serviceTier: string | undefined;
+        } = {
           usage: undefined,
           stopReason: undefined,
           model: undefined,
+          serviceTier: undefined,
         };
         while (true) {
           const { done, value } = await reader.read();
@@ -454,7 +496,13 @@ function teeForUsage(res: Response): {
         }
         buf += decoder.decode();
         if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
-        return { usage: state.usage, measurement: m, stopReason: state.stopReason, model: state.model };
+        return {
+          usage: state.usage,
+          measurement: m,
+          stopReason: state.stopReason,
+          model: state.model,
+          serviceTier: state.serviceTier,
+        };
       }
 
       if (ct.includes('application/json')) {
@@ -472,9 +520,16 @@ function teeForUsage(res: Response): {
             measurement: measureFromMessageJson(j),
             stopReason: readStopReasonFromJson(j),
             model: typeof j?.model === 'string' ? j.model : undefined,
+            serviceTier: typeof j?.service_tier === 'string' ? j.service_tier : undefined,
           };
         } catch {
-          return { usage: undefined, measurement: undefined, stopReason: undefined, model: undefined };
+          return {
+            usage: undefined,
+            measurement: undefined,
+            stopReason: undefined,
+            model: undefined,
+            serviceTier: undefined,
+          };
         }
       }
     } catch {
@@ -489,7 +544,13 @@ function teeForUsage(res: Response): {
     } catch {
       /* ignore */
     }
-    return { usage: undefined, measurement: undefined, stopReason: undefined, model: undefined };
+    return {
+      usage: undefined,
+      measurement: undefined,
+      stopReason: undefined,
+      model: undefined,
+      serviceTier: undefined,
+    };
   })();
 
   return {
@@ -503,6 +564,7 @@ function teeForUsage(res: Response): {
     measurementPromise: scanResult.then((s) => s.measurement),
     stopReasonPromise: scanResult.then((s) => s.stopReason),
     modelPromise: scanResult.then((s) => s.model),
+    serviceTierPromise: scanResult.then((s) => s.serviceTier),
   };
 }
 
@@ -677,6 +739,7 @@ export function createProxy(config: ProxyConfig = {}) {
       measurement?: OutputMeasurement,
       stopReason?: string,
       resolvedModel?: string,
+      serviceTier?: string,
     ): void => {
       const is4xx = status >= 400 && status < 500;
       // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
@@ -737,6 +800,7 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodyGz,
           measurement,
           stopReason,
+          serviceTier,
         });
       };
       void finalize();
@@ -805,6 +869,8 @@ export function createProxy(config: ProxyConfig = {}) {
             : r.body;
         bodyOut = optimizedBody as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
+        info.requestBodyInputBytes = bodyIn.byteLength;
+        info.requestBodyOutputBytes = optimizedBody.byteLength;
         reqBodyBytes = optimizedBody;
         if (optimizedBody.byteLength > 0) {
           reqBodySha8 = await sha8Bytes(optimizedBody);
@@ -881,7 +947,15 @@ export function createProxy(config: ProxyConfig = {}) {
     const firstByteMs = Date.now() - t0;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise, modelPromise } =
+    const {
+      response: teed,
+      usagePromise,
+      errorBodyPromise,
+      measurementPromise,
+      stopReasonPromise,
+      modelPromise,
+      serviceTierPromise,
+    } =
       teeForUsage(upstreamRes);
 
     // Fire event in background once all scanner fields resolve (they share one stream read).
@@ -891,9 +965,22 @@ export function createProxy(config: ProxyConfig = {}) {
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
       modelPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason, resolvedModel]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason, resolvedModel),
-    );
+      serviceTierPromise.catch(() => undefined),
+    ]).then(([usage, errorBody, measurement, stopReason, resolvedModel, serviceTier]) => {
+      releaseUpstream?.();
+      fire(
+        upstreamRes.status,
+        info,
+        undefined,
+        firstByteMs,
+        usage,
+        errorBody,
+        measurement,
+        stopReason,
+        resolvedModel,
+        serviceTier,
+      );
+    });
 
     return new Response(teed.body, {
       status: upstreamRes.status,

@@ -36,6 +36,9 @@ export interface StatsPayload {
   baseline_token_equivalent: number;
   actual_token_equivalent: number;
   pricing_assumptions: PricingAssumptions;
+  /** Provider-specific accounting buckets. OpenAI has no monetary conversion. */
+  providers?: Record<string, DashboardProviderStats>;
+  pricing_by_provider?: Record<string, ProviderPricingAssumptions>;
   measured_text_chars: number;
   measured_thinking_chars: number;
   measured_tool_use_chars: number;
@@ -43,6 +46,54 @@ export interface StatsPayload {
   events_with_measurement: number;
   uptime_sec_unused?: never; // future-proof
   compression_enabled: boolean;
+}
+
+export interface ProviderPricingAssumptions {
+  monetary_supported: boolean;
+  unit: string;
+  input_per_mtok?: number;
+  output_multiplier?: number;
+  cache_read_multiplier?: number;
+  cache_write_multiplier?: number;
+  source?: string;
+}
+
+export interface DashboardProviderStats {
+  provider: 'anthropic' | 'openai' | 'other';
+  requests: number;
+  compressed_requests: number;
+  usage_requests: number;
+  baseline_measured_count: number;
+  baseline_input_weighted: number;
+  actual_input_weighted: number;
+  output_weighted: number;
+  all_baseline_equivalent_weighted: number;
+  all_actual_input_weighted: number;
+  all_output_weighted: number;
+  saved_input_weighted: number;
+  saved_pct_input_only: number;
+  compressed_paid_requests: number;
+  passthrough_paid_requests: number;
+  compressed_avg_input_weighted: number;
+  passthrough_avg_input_weighted: number;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  anthropic_cache_create_tokens: number;
+  anthropic_cache_read_tokens: number;
+  openai_cached_tokens: number;
+  openai_cache_write_tokens: number;
+  image_tokens: number;
+  baseline_imaged_tokens: number;
+  raw_actual_tokens: number;
+  raw_baseline_tokens: number;
+  raw_output_tokens: number;
+  safety_flagged: number;
+  models: Array<[string, number]>;
+  service_tiers: Array<[string, number]>;
+  stop_reasons: Array<[string, number]>;
+  monetary_supported: boolean;
+  saved_usd?: number;
 }
 
 export interface PricingAssumptions {
@@ -60,6 +111,9 @@ export interface RecentPayload {
   has_preview: boolean;
   preview_meta: string;
   image_ids?: number[];
+  preview_provider?: 'anthropic' | 'openai' | 'other';
+  preview_model?: string;
+  preview_service_tier?: string;
 }
 
 export interface RecentRow {
@@ -70,11 +124,23 @@ export interface RecentRow {
   status: number;
   size_in?: number;
   compressed: boolean;
+  /** Provider classification; accounting must never infer this from a UI label. */
+  provider?: 'anthropic' | 'openai' | 'other';
+  service_tier?: string;
+  stop_reason?: string;
+  safety_flagged?: boolean;
+  sent_as?: 'image' | 'text' | 'error';
   cc_added?: number;
   input_tokens?: number;
   output_tokens?: number;
+  reasoning_tokens?: number;
   cache_create?: number;
   cache_read?: number;
+  cache_write?: number;
+  cached_tokens?: number;
+  ordinary_input_tokens?: number;
+  image_tokens?: number;
+  baseline_imaged_tokens?: number;
   actual_input?: number;
   baseline_input?: number;
   session_saved_so_far_delta?: number;
@@ -98,6 +164,15 @@ export interface SessionRow {
   charsSaved: number;
   tokensSavedEst: number;
   cacheReadTokens: number;
+  cacheWriteTokens?: number;
+  cachedTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  imageTokens?: number;
+  models?: string[];
+  providers?: string[];
+  serviceTiers?: string[];
   jsonlBytes: number;
   sidecarBytes: number;
   claudeCode: ClaudeCodeRef | null;
@@ -127,11 +202,13 @@ export interface FullStatsSummary {
   compressed: number;
   passthrough: number;
   inputTokensTotal: number;
+  ordinaryInputTokensTotal?: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
   openAICachedTokensTotal: number;
   openAICacheWriteTokensTotal: number;
   outputTokensTotal: number;
+  reasoningTokensTotal?: number;
   cacheHitEvents: number;
   eventsWithBaseline: number;
   origCharsTotal: number;
@@ -140,6 +217,37 @@ export interface FullStatsSummary {
   durationP95: number;
   firstByteP50: number;
   firstByteP95: number;
+  models?: Array<[string, number]>;
+  serviceTiers?: Array<[string, number]>;
+  stopReasons?: Array<[string, number]>;
+  safetyFlagged?: number;
+  byProvider?: Record<string, ProviderStatsPayload>;
+}
+
+export interface ProviderStatsPayload {
+  provider: 'anthropic' | 'openai' | 'other';
+  total: number;
+  ok2xx: number;
+  err4xx: number;
+  err5xx: number;
+  compressed: number;
+  passthrough: number;
+  eventsWithUsage: number;
+  inputTokensTotal: number;
+  ordinaryInputTokensTotal: number;
+  outputTokensTotal: number;
+  reasoningTokensTotal: number;
+  cacheCreateTokensTotal: number;
+  cacheReadTokensTotal: number;
+  cachedTokensTotal: number;
+  cacheWriteTokensTotal: number;
+  imageTokensTotal: number;
+  baselineImagedTokensTotal: number;
+  cacheHitEvents: number;
+  safetyFlagged: number;
+  models: Array<[string, number]>;
+  serviceTiers: Array<[string, number]>;
+  stopReasons: Array<[string, number]>;
 }
 
 /** POST /api/compression response. */
@@ -165,4 +273,29 @@ export interface CurrentSessionPayload {
   rawBaselineTokens?: number;
   /** Raw output tokens — shown as an "untouched" note; output is never compressed. */
   rawOutputTokens?: number;
+  providers?: Record<string, CurrentSessionProviderPayload>;
+}
+
+export interface CurrentSessionProviderPayload {
+  provider: 'anthropic' | 'openai' | 'other';
+  requests: number;
+  compressedRequests: number;
+  usageRequests: number;
+  baselineMeasuredCount: number;
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  outputWeighted: number;
+  savedInputWeighted: number;
+  rawActualTokens: number;
+  rawBaselineTokens: number;
+  rawOutputTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  imageTokens: number;
+  baselineImagedTokens: number;
+  models: Array<[string, number]>;
+  serviceTiers: Array<[string, number]>;
 }

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createProxy } from '../src/core/proxy.js';
+import { applyGpt56RequestOptimizations } from '../src/core/openai.js';
+import type { TransformInfo } from '../src/core/transform.js';
 
 const realFetch = globalThis.fetch;
 
@@ -118,6 +120,45 @@ describe('GPT-5.6 API cost optimizations', () => {
     expect(findBreakpoint(out, 'input')).toBeUndefined();
     expect(out.reasoning).toEqual({ effort: 'high', context: 'all_turns' });
     expect(out.include).toEqual(['reasoning.encrypted_content']);
+  });
+
+  it('measures caller cache routing and encrypted reasoning without changing them', () => {
+    const request = {
+      model: 'gpt-5.6-luna',
+      prompt_cache_key: 'codex-native-key',
+      reasoning: { effort: 'max', context: 'all_turns' },
+      input: [
+        { type: 'reasoning', encrypted_content: 'encrypted-one', summary: [] },
+        { type: 'reasoning', encrypted_content: 'encrypted-two', summary: [] },
+        { role: 'user', content: 'Continue.' },
+      ],
+    };
+    const body = new TextEncoder().encode(JSON.stringify(request));
+    const info: TransformInfo = {
+      compressed: true,
+      origChars: 0,
+      compressedChars: 0,
+      imageCount: 0,
+      imageBytes: 0,
+      staticChars: 0,
+      dynamicChars: 0,
+      dynamicBlockCount: 0,
+    };
+
+    const out = applyGpt56RequestOptimizations(body, 'responses', {}, info, false);
+
+    expect(out).toBe(body);
+    expect(info).toMatchObject({
+      gptReasoningItems: 2,
+      gptEncryptedReasoningItems: 2,
+      gptEncryptedReasoningBytes: 26,
+      gptReasoningEffort: 'max',
+      gptReasoningContext: 'all_turns',
+      gptPromptCacheKeyPresent: true,
+    });
+    expect(info.gptReasoningBytes).toBeGreaterThan(26);
+    expect(info.gptPromptCacheKeyFingerprint)
+      .toMatch(/^fnv-[0-9a-f]{8}-16$/);
   });
 
   it('opts an existing previous_response_id chain into persisted reasoning', async () => {

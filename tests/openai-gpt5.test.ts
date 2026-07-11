@@ -658,6 +658,7 @@ describe('transformOpenAIResponses — history collapse', () => {
   });
 
   it('produces a byte-stable history image sha across identical requests', async () => {
+    clearOpenAIRenderCache();
     const make = () => enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions: BIG_SLAB,
@@ -667,6 +668,10 @@ describe('transformOpenAIResponses — history collapse', () => {
     const b = await transformOpenAIResponses(make(), { charsPerToken: 1, minCompressChars: 1 });
     expect(a.info.historyImageSha).toBeDefined();
     expect(a.info.historyImageSha).toBe(b.info.historyImageSha);
+    expect(a.info.gptRenderCacheMisses).toBeGreaterThan(0);
+    expect(b.info.gptRenderCacheHits).toBe(a.info.gptRenderCacheMisses);
+    expect(b.info.gptRenderCacheMisses).toBe(0);
+    expect(b.info.gptRenderCacheSavedMs).toBeGreaterThanOrEqual(0);
   });
 
   it('does not collapse when collapseHistory is off', async () => {

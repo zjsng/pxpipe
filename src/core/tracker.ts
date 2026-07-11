@@ -6,6 +6,7 @@
 
 import type { ProxyEvent } from './proxy.js';
 import { bytesToBase64 } from './png.js';
+import { serviceTierFor } from './provider.js';
 
 /** Flat record persisted per request. Adding a field is non-breaking for readers. */
 export interface TrackEvent {
@@ -102,6 +103,17 @@ export interface TrackEvent {
   gpt_reasoning_items?: number;
   /** Forwarded reasoning items containing encrypted_content. */
   gpt_encrypted_reasoning_items?: number;
+  gpt_render_cache_hits?: number;
+  gpt_render_cache_misses?: number;
+  gpt_render_cache_saved_ms?: number;
+  request_body_input_bytes?: number;
+  request_body_output_bytes?: number;
+  gpt_reasoning_effort?: string;
+  gpt_reasoning_context?: string;
+  gpt_reasoning_bytes?: number;
+  gpt_encrypted_reasoning_bytes?: number;
+  gpt_prompt_cache_key_present?: boolean;
+  gpt_prompt_cache_key_fingerprint?: string;
 
   // From TransformInfo.env:
   cwd?: string;
@@ -125,6 +137,8 @@ export interface TrackEvent {
   cached_tokens?: number;
   /** GPT-5.6+ cache writes (subset of input_tokens, billed at write rate). */
   cache_write_tokens?: number;
+  /** OpenAI reasoning-token subset of output_tokens. */
+  reasoning_tokens?: number;
   /** GPT history-only compression telemetry. */
   history_baseline_tokens?: number;
   history_image_tokens?: number;
@@ -140,6 +154,8 @@ export interface TrackEvent {
   /** Model stop reason ("end_turn", "tool_use", "max_tokens", "refusal", …).
    *  OpenAI finish_reason ("stop", "length", "content_filter", …) lands in the same field. */
   stop_reason?: string;
+  /** Provider-reported service tier, or a model-suffix fallback. */
+  service_tier?: string;
   /** True when the stop reason indicates a safety classifier fired ("refusal" /
    *  "content_filter"). Refusal rows emit almost no output and would otherwise
    *  read as "cheap" — scorers MUST fail cost comparisons on these rows, and a
@@ -305,6 +321,23 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.gptEncryptedReasoningItems !== undefined) {
       out.gpt_encrypted_reasoning_items = info.gptEncryptedReasoningItems;
     }
+    if (info.gptRenderCacheHits !== undefined) out.gpt_render_cache_hits = info.gptRenderCacheHits;
+    if (info.gptRenderCacheMisses !== undefined) out.gpt_render_cache_misses = info.gptRenderCacheMisses;
+    if (info.gptRenderCacheSavedMs !== undefined) out.gpt_render_cache_saved_ms = info.gptRenderCacheSavedMs;
+    if (info.requestBodyInputBytes !== undefined) out.request_body_input_bytes = info.requestBodyInputBytes;
+    if (info.requestBodyOutputBytes !== undefined) out.request_body_output_bytes = info.requestBodyOutputBytes;
+    if (info.gptReasoningEffort !== undefined) out.gpt_reasoning_effort = info.gptReasoningEffort;
+    if (info.gptReasoningContext !== undefined) out.gpt_reasoning_context = info.gptReasoningContext;
+    if (info.gptReasoningBytes !== undefined) out.gpt_reasoning_bytes = info.gptReasoningBytes;
+    if (info.gptEncryptedReasoningBytes !== undefined) {
+      out.gpt_encrypted_reasoning_bytes = info.gptEncryptedReasoningBytes;
+    }
+    if (info.gptPromptCacheKeyPresent !== undefined) {
+      out.gpt_prompt_cache_key_present = info.gptPromptCacheKeyPresent;
+    }
+    if (info.gptPromptCacheKeyFingerprint !== undefined) {
+      out.gpt_prompt_cache_key_fingerprint = info.gptPromptCacheKeyFingerprint;
+    }
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
     if (info.churningStaticTags && info.churningStaticTags.length > 0)
@@ -344,6 +377,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.cached_tokens = u.cached_tokens;
     if (u.cache_write_tokens !== undefined)
       out.cache_write_tokens = u.cache_write_tokens;
+    if (u.reasoning_tokens !== undefined)
+      out.reasoning_tokens = u.reasoning_tokens;
+    if (u.service_tier !== undefined)
+      out.service_tier = u.service_tier;
     // cache_creation splits cache_creation_input_tokens across 5-min (1.25x) and 1-hour (2x) tiers.
     if (u.cache_creation) {
       if (u.cache_creation.ephemeral_5m_input_tokens !== undefined)
@@ -366,11 +403,13 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     out.stop_reason = ev.stopReason;
     if (SAFETY_STOP_REASONS.has(ev.stopReason)) out.safety_flagged = true;
   }
+  const tier = serviceTierFor(ev.model, ev.serviceTier);
+  if (tier) out.service_tier = tier;
   return out;
 }
 
 /** Stop reasons that mean a safety classifier fired (Anthropic / OpenAI spellings). */
-const SAFETY_STOP_REASONS = new Set(['refusal', 'content_filter']);
+const SAFETY_STOP_REASONS = new Set(['refusal', 'content_filter', 'safety', 'safety_refusal', 'blocked']);
 
 /** Writes one JSON line per event. Worker host uses console.log; Node host uses a file-backed variant. */
 export class JsonLogTracker implements Tracker {
