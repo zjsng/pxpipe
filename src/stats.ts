@@ -33,6 +33,8 @@ export interface Summary {
   outputTokensTotal: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
+  openAICachedTokensTotal: number;
+  openAICacheWriteTokensTotal: number;
   /** Number of events whose cache_read_tokens > 0 — i.e. the prompt cache
    *  actually hit. */
   cacheHitEvents: number;
@@ -63,6 +65,8 @@ export function newSummary(): Summary {
     outputTokensTotal: 0,
     cacheCreateTokensTotal: 0,
     cacheReadTokensTotal: 0,
+    openAICachedTokensTotal: 0,
+    openAICacheWriteTokensTotal: 0,
     cacheHitEvents: 0,
     eventsWithUsage: 0,
     durationMs: [],
@@ -96,6 +100,8 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     typeof ev.input_tokens === 'number' ||
     typeof ev.cache_read_tokens === 'number' ||
     typeof ev.cache_create_tokens === 'number' ||
+    typeof ev.cached_tokens === 'number' ||
+    typeof ev.cache_write_tokens === 'number' ||
     typeof ev.output_tokens === 'number';
   if (hasUsage) {
     s.eventsWithUsage++;
@@ -103,6 +109,8 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     s.outputTokensTotal += ev.output_tokens ?? 0;
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
     s.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
+    s.openAICachedTokensTotal += ev.cached_tokens ?? 0;
+    s.openAICacheWriteTokensTotal += ev.cache_write_tokens ?? 0;
     if ((ev.cache_read_tokens ?? 0) > 0) s.cacheHitEvents++;
   }
 
@@ -303,6 +311,8 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     outputTokensTotal: s.outputTokensTotal,
     cacheCreateTokensTotal: s.cacheCreateTokensTotal,
     cacheReadTokensTotal: s.cacheReadTokensTotal,
+    openAICachedTokensTotal: s.openAICachedTokensTotal,
+    openAICacheWriteTokensTotal: s.openAICacheWriteTokensTotal,
     cacheHitEvents: s.cacheHitEvents,
     eventsWithUsage: s.eventsWithUsage,
     durationP50: percentile(sortedDur, 50),

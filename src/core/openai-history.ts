@@ -9,7 +9,8 @@
  * recent tail as text.
  *
  * OpenAI prompt-caching is automatic and prefix-based: no `cache_control`
- * breakpoints, no 1.25× write premium, cached reads at ~0.1×. The collapse
+ * breakpoints, cached reads at ~0.1×. GPT-5.6 also reports cache writes at a
+ * 1.25× rate; the collapse
  * boundary is snapped to a chunk grid so the history image stays byte-identical
  * across turns and keeps hitting that automatic cache (the same flap-avoidance
  * trick src/core/history.ts uses for Anthropic).
@@ -123,6 +124,8 @@ export interface HistoryTurn {
   /** Item we can't safely serialize (unknown kind, item_reference) — a hard
    *  barrier: never collapse across it, since dropping it could lose state. */
   opaque: boolean;
+  /** Diagnostic kind for an opaque item. The raw item always remains native. */
+  opaqueKind?: string;
   /** Raw body when this item is a real USER request (role==='user', not a tool
    *  result). The planner pins the MOST RECENT such turn as legible text instead
    *  of imaging it, so the live ask is never OCR-only. undefined = not a user turn. */
@@ -147,8 +150,12 @@ export interface GptCollapsePlan {
   endExclusive: number;
   collapsedTurns: number;
   collapsedChars: number;
+  /** Latest opaque barrier skipped before the collapsible suffix, if any. */
+  opaqueBarrierIndex?: number;
+  opaqueBarrierKind?: string;
   reason?:
     | 'prefix_too_short'
+    | 'opaque_barrier'
     | 'no_closed_prefix'
     | 'below_min_tokens'
     | 'not_profitable'
@@ -236,10 +243,47 @@ export async function planGptCollapse(
     droppedChars: 0,
     droppedCodepoints: new Map(),
   };
-  const pp = Math.max(0, Math.min(protectedPrefix, turns.length));
+  const protectedStart = Math.max(0, Math.min(protectedPrefix, turns.length));
   const rawCutoff = turns.length - o.keepTail;
+  // Unknown/encrypted Responses items must remain native. They used to block the
+  // entire transcript, even when a large, fully-closed custom-tool suffix followed.
+  // Collapse only the safe suffix after the latest barrier; caller splicing leaves
+  // every earlier item byte-for-byte intact.
+  let pp = protectedStart;
+  let opaqueBarrierIndex: number | undefined;
+  let opaqueBarrierKind: string | undefined;
+  const openBeforeBarrier = new Set<string>();
+  for (let i = protectedStart; i < Math.max(protectedStart, rawCutoff); i++) {
+    const turn = turns[i]!;
+    if (turn.opaque) {
+      pp = i + 1;
+      opaqueBarrierIndex = i;
+      opaqueBarrierKind = turn.opaqueKind ?? 'unknown';
+      openBeforeBarrier.clear();
+      continue;
+    }
+    for (const id of turn.openIds) openBeforeBarrier.add(id);
+    let unmatchedClose = false;
+    for (const id of turn.closeIds) {
+      if (!openBeforeBarrier.has(id)) unmatchedClose = true;
+      openBeforeBarrier.delete(id);
+    }
+    // A close belonging to a native call before the current safe suffix cannot
+    // be imaged on its own. Preserve that output too and begin after it.
+    if (unmatchedClose) {
+      pp = i + 1;
+      opaqueBarrierIndex = i;
+      opaqueBarrierKind = 'unmatched_tool_output';
+      openBeforeBarrier.clear();
+    }
+  }
   if (rawCutoff - pp < o.minCollapsePrefix) {
-    return { ...base, reason: 'prefix_too_short' };
+    return {
+      ...base,
+      reason: opaqueBarrierIndex === undefined ? 'prefix_too_short' : 'opaque_barrier',
+      opaqueBarrierIndex,
+      opaqueBarrierKind,
+    };
   }
   // Snap the cutoff down to a collapseChunk grid (relative to pp) so the image
   // stays byte-stable across turns. Floor at pp + minCollapsePrefix.
@@ -255,7 +299,7 @@ export async function planGptCollapse(
       : rawCutoff;
   const boundary = findClosedBoundary(turns, cutoff, pp);
   if (boundary < pp) {
-    return { ...base, reason: 'no_closed_prefix' };
+    return { ...base, reason: 'no_closed_prefix', opaqueBarrierIndex, opaqueBarrierKind };
   }
   if (boundary + 1 - pp < o.minCollapsePrefix) {
     return { ...base, reason: 'prefix_too_short' };
@@ -294,7 +338,7 @@ export async function planGptCollapse(
   // sessions (where the bug lived) clear the floor and collapse.
   const baselineTextTokens = gptCountTokens(text);
   if (!text || baselineTextTokens < o.minCollapseTokens) {
-    return { ...base, reason: 'below_min_tokens', collapsedChars: text?.length ?? 0 };
+    return { ...base, reason: 'below_min_tokens', collapsedChars: text?.length ?? 0, opaqueBarrierIndex, opaqueBarrierKind };
   }
   // Reflow for RENDERING ONLY: pack soft-wrapped lines and mark hard newlines
   // with the ↵ sentinel so the history image is as dense as the static slab
@@ -304,7 +348,7 @@ export async function planGptCollapse(
   const safeText = neutralizeSentinel(text);
   const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
   if (!isProfitable(renderText, o.cols, baselineTextTokens)) {
-    return { ...base, reason: 'not_profitable', collapsedChars: text.length };
+    return { ...base, reason: 'not_profitable', collapsedChars: text.length, opaqueBarrierIndex, opaqueBarrierKind };
   }
   // APPEND-ONLY, TOKEN-LENGTH sectioning. Cut the closed prefix [pp..rawEnd) into
   // sections of ~sectionTokens o200k tokens by walking turns from pp and sealing a
@@ -429,6 +473,8 @@ export async function planGptCollapse(
     endExclusive: collapseEnd,
     collapsedTurns: collapseEnd - pp - (pinConsumed ? 1 : 0),
     collapsedChars: collapsedText.length,
+    opaqueBarrierIndex,
+    opaqueBarrierKind,
     droppedChars,
     droppedCodepoints,
   };
@@ -485,7 +531,29 @@ function responsesItemToTurn(item: unknown, idx: number): HistoryTurn {
       opaque: false,
     };
   }
+  if (type === 'custom_tool_call') {
+    const callId =
+      typeof o.call_id === 'string' ? o.call_id : typeof o.id === 'string' ? o.id : '';
+    const name = typeof o.name === 'string' ? o.name : 'custom_tool';
+    const input = typeof o.input === 'string' ? o.input : safeJson(o.input);
+    return {
+      text: `[tool_use ${name}]\n${input}`,
+      openIds: callId ? [callId] : [],
+      closeIds: [],
+      opaque: false,
+    };
+  }
   if (type === 'function_call_output') {
+    const callId = typeof o.call_id === 'string' ? o.call_id : '';
+    const out = typeof o.output === 'string' ? o.output : safeJson(o.output);
+    return {
+      text: `[tool_result]\n${out}`,
+      openIds: [],
+      closeIds: callId ? [callId] : [],
+      opaque: false,
+    };
+  }
+  if (type === 'custom_tool_call_output') {
     const callId = typeof o.call_id === 'string' ? o.call_id : '';
     const out = typeof o.output === 'string' ? o.output : safeJson(o.output);
     return {
@@ -513,7 +581,7 @@ function responsesItemToTurn(item: unknown, idx: number): HistoryTurn {
     };
   }
   // Unknown item kind (e.g. item_reference) we can't safely serialize → barrier.
-  return { text: '', openIds: [], closeIds: [], opaque: true };
+  return { text: '', openIds: [], closeIds: [], opaque: true, opaqueKind: type ?? 'unknown' };
 }
 
 export function responsesItemsToTurns(items: unknown[]): HistoryTurn[] {

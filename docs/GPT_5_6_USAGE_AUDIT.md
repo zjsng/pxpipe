@@ -35,8 +35,9 @@ The closest observable plan-limit comparison also rejects the 2× hypothesis:
   GPT 5.6 versus **1.30M** for the closest recent GPT 5.5 window.
 
 GPT 5.6 therefore appeared to move the meter roughly 10–17% faster per Codex
-turn in these samples, not 100% faster. The cause is more model calls per turn,
-not a hidden per-token tariff. Whole-percentage reporting, concurrent agents,
+turn in these samples, not 100% faster. The quota evidence points primarily to
+more model calls per turn; GPT-5.6 cache-write pricing is tracked separately in
+the follow-up below. Whole-percentage reporting, concurrent agents,
 and auto-review traffic make exact limit-window comparisons noisy.
 
 ## What is burning usage
@@ -117,3 +118,23 @@ This is an observational comparison, not a controlled A/B test: GPT 5.5 spans
 concurrent auto-review traffic. The next trustworthy step is a live on/off A/B
 with the same task corpus and concurrency, comparing price-weighted tokens and
 plan-percentage movement rather than raw input tokens alone.
+
+## Follow-up: all GPT-5.6 tiers and history barriers
+
+The family analysis and regressions explicitly cover `gpt-5.6-sol`,
+`gpt-5.6-terra`, and `gpt-5.6-luna`. Re-run the aggregate-only analyzer with:
+
+```sh
+pnpm audit:gpt-usage -- --before 2026-07-11T00:00:00Z
+pnpm audit:gpt-usage -- --json > /tmp/gpt-usage.json
+```
+
+The follow-up transcript-shape scan found that Codex custom tool pairs occurred
+roughly five times as often as standard function pairs. Supporting those pairs
+made 62.2% of post-call states eligible for history collapse; preserving opaque
+agent messages and starting after the latest barrier raised eligibility to
+81.2%. These are candidate states, not claimed realized savings.
+
+GPT-5.6+ cache writes are now captured separately as `cache_write_tokens` and
+priced at 1.25x for API-cost reporting. Gross input remains the plan-usage view,
+because cached tokens still contribute to rate limits.

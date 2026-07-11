@@ -359,7 +359,7 @@ function isOpenAIEvent(path: string | undefined): boolean {
  *  plain scalars (replay has no Usage/TransformInfo objects, only JSONL fields).
  *
  *  GPT differs from Anthropic on every axis: input_tokens already INCLUDES the
- *  cached subset (`cachedTokens`), there is no cache-create premium, the cached
+ *  cached subset (`cachedTokens`), GPT-5.6 cache writes carry a premium, the cached
  *  prefix reads at ~0.1×, and the baseline is the measured `baselineImagedTokens`
  *  (o200k text-token cost of the imaged content) vs the vision-token `imageTokens`
  *  pxpipe actually paid — not a count_tokens probe. No per-session warmth state:
@@ -370,6 +370,7 @@ function gptEff(args: {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   imageTokens: number;
   baselineImagedTokens: number;
   compressed: boolean;
@@ -383,16 +384,16 @@ function gptEff(args: {
   rawActual: number;
   rawBaseline: number;
 } {
-  const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached } = args;
+  const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached, cacheWriteTokens: written } = args;
   const { imageTokens, baselineImagedTokens, compressed } = args;
   const haveUsage = inp > 0 || out > 0;
   // The transform measured what the imaged content would have cost as o200k
   // text; without it there is no counterfactual to credit.
   const haveBaseline = baselineImagedTokens > 0;
-  const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model) : 0;
+  const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model, written) : 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
   const baselineInputEff = creditSaving
-    ? computeOpenAIBaselineInputEff(inp, cached, imageTokens, baselineImagedTokens, model)
+    ? computeOpenAIBaselineInputEff(inp, cached, imageTokens, baselineImagedTokens, model, written)
     : actualInputEff;
   const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
   // Raw, rate-free token counts for the session's compression ratio and the
@@ -596,6 +597,7 @@ export class DashboardState {
         inputTokens: inp,
         outputTokens: out,
         cachedTokens: u?.cached_tokens ?? 0,
+        cacheWriteTokens: u?.cache_write_tokens ?? 0,
         imageTokens: info?.imageTokens ?? 0,
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
         compressed,
@@ -929,6 +931,7 @@ export class DashboardState {
           inputTokens: inp,
           outputTokens: out,
           cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
+          cacheWriteTokens: (t as { cache_write_tokens?: number }).cache_write_tokens ?? 0,
           imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
           baselineImagedTokens:
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,

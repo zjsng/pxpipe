@@ -54,6 +54,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:restart": "bash tests/restart.test.sh",
+    "audit:gpt-usage": "node eval/analyze-gpt-usage.mjs",
     "prepublishOnly": "pnpm run typecheck && pnpm test && pnpm run build",
     "vendor:ui": "node scripts/vendor-ui.mjs"
   },

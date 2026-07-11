@@ -76,6 +76,8 @@ export interface Usage {
    *  (billed at ~0.1× for the gpt-5 family). Mapped from `input_tokens_details`
    *  / `prompt_tokens_details.cached_tokens`. Anthropic uses cache_read instead. */
   cached_tokens?: number;
+  /** GPT-5.6+ prompt tokens written to cache, a subset of input_tokens. */
+  cache_write_tokens?: number;
 }
 
 export interface MessagesRequest {

@@ -49,6 +49,17 @@ describe('responsesItemsToTurns', () => {
     expect(turns[1]!.text).toContain('[tool_result]');
   });
 
+  it('tracks Codex custom_tool_call pairs without making them opaque', () => {
+    const turns = responsesItemsToTurns([
+      { type: 'custom_tool_call', call_id: 'ct1', name: 'exec', input: 'const x = 1' },
+      { type: 'custom_tool_call_output', call_id: 'ct1', output: [{ type: 'input_text', text: 'ok' }] },
+    ]);
+    expect(turns[0]).toMatchObject({ openIds: ['ct1'], closeIds: [], opaque: false });
+    expect(turns[0]!.text).toContain('[tool_use exec]');
+    expect(turns[1]).toMatchObject({ openIds: [], closeIds: ['ct1'], opaque: false });
+    expect(turns[1]!.text).toContain('input_text');
+  });
+
   it('drops reasoning items (empty text, not opaque)', () => {
     const [t] = responsesItemsToTurns([{ type: 'reasoning', summary: [] }]);
     expect(t!.text).toBe('');
@@ -58,6 +69,7 @@ describe('responsesItemsToTurns', () => {
   it('marks unknown item kinds opaque (collapse barrier)', () => {
     const [t] = responsesItemsToTurns([{ type: 'item_reference', id: 'x' }]);
     expect(t!.opaque).toBe(true);
+    expect(t!.opaqueKind).toBe('item_reference');
   });
 });
 
@@ -155,11 +167,33 @@ describe('planGptCollapse — closed-tool-call boundary', () => {
     expect(plan.endExclusive).toBeLessThanOrEqual(18);
   });
 
-  it('stops at an opaque barrier', async () => {
+  it('preserves an opaque barrier and collapses the safe suffix after it', async () => {
     const turns = plainTurns(40, 1000);
-    turns[15] = { text: '', openIds: [], closeIds: [], opaque: true };
+    turns[15] = { text: '', openIds: [], closeIds: [], opaque: true, opaqueKind: 'agent_message' };
     const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0 });
-    expect(plan.endExclusive).toBeLessThanOrEqual(15);
+    expect(plan.start).toBe(16);
+    expect(plan.endExclusive).toBeGreaterThan(16);
+    expect(plan.opaqueBarrierIndex).toBe(15);
+    expect(plan.opaqueBarrierKind).toBe('agent_message');
+  });
+
+  it('reports an opaque barrier when its remaining suffix is only the live tail', async () => {
+    const turns = plainTurns(12, 1000);
+    turns[5] = { text: '', openIds: [], closeIds: [], opaque: true, opaqueKind: 'agent_message' };
+    const plan = await planGptCollapse(turns, 0, yes);
+    expect(plan.images).toHaveLength(0);
+    expect(plan.reason).toBe('opaque_barrier');
+    expect(plan.opaqueBarrierIndex).toBe(5);
+  });
+
+  it('does not split a tool pair across an opaque barrier', async () => {
+    const turns = plainTurns(40, 1000);
+    turns[10] = { text: '[tool_use exec]', openIds: ['cross'], closeIds: [], opaque: false };
+    turns[11] = { text: '', openIds: [], closeIds: [], opaque: true, opaqueKind: 'agent_message' };
+    turns[12] = { text: '[tool_result]', openIds: [], closeIds: ['cross'], opaque: false };
+    const plan = await planGptCollapse(turns, 0, yes, { collapseChunk: 0 });
+    expect(plan.start).toBeGreaterThan(12);
+    expect(plan.opaqueBarrierKind).toBe('unmatched_tool_output');
   });
 
   it('never ends the collapse between a function_call and its output (orphan 400)', async () => {

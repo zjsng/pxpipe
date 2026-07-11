@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { newSummary, fold, renderTextReport } from '../src/stats.js';
+import { newSummary, fold, renderTextReport, summaryToJson } from '../src/stats.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 
 function ev(partial: Partial<TrackEvent>): TrackEvent {
@@ -82,6 +82,16 @@ describe('stats aggregator', () => {
     expect(s.outputTokensTotal).toBe(21);
     expect(s.cacheReadTokensTotal).toBe(10000);
     expect(s.cacheCreateTokensTotal).toBe(5000);
+  });
+
+  it('aggregates OpenAI cached reads and GPT-5.6 cache writes separately', () => {
+    const s = newSummary();
+    fold(s, ev({ input_tokens: 10_000, cached_tokens: 8_000, cache_write_tokens: 1_000 }));
+    expect(s.openAICachedTokensTotal).toBe(8_000);
+    expect(s.openAICacheWriteTokensTotal).toBe(1_000);
+    const json = summaryToJson(s);
+    expect(json.openAICachedTokensTotal).toBe(8_000);
+    expect(json.openAICacheWriteTokensTotal).toBe(1_000);
   });
 
   it('buckets by cwd and tracks system_sha8 reuse', () => {

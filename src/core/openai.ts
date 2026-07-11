@@ -579,6 +579,10 @@ function foldGptHistory(
   model: string,
   plan: GptCollapsePlan,
 ): void {
+  if (plan.opaqueBarrierIndex !== undefined) {
+    info.historyBarrierIndex = plan.opaqueBarrierIndex;
+    info.historyBarrierKind = plan.opaqueBarrierKind ?? 'unknown';
+  }
   // A pin can split the collapse into before/after image groups — account for both.
   const allImages = [...plan.images, ...plan.imagesAfter];
   if (allImages.length === 0) {
@@ -586,9 +590,13 @@ function foldGptHistory(
     if (plan.collapsedChars > 0) info.historyTextChars = plan.collapsedChars;
     return;
   }
-  info.imageTokens = (info.imageTokens ?? 0) + gptImageTokens(model, allImages);
+  const historyImageTokens = gptImageTokens(model, allImages);
+  const historyBaselineTokens = gptTextTokens(plan.text);
+  info.historyImageTokens = historyImageTokens;
+  info.historyBaselineTokens = historyBaselineTokens;
+  info.imageTokens = (info.imageTokens ?? 0) + historyImageTokens;
   // o200k token value of the collapsed transcript (what it cost as plain text).
-  info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + gptTextTokens(plan.text);
+  info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + historyBaselineTokens;
   info.imageCount = (info.imageCount ?? 0) + allImages.length;
   for (const img of allImages) {
     info.imageBytes = (info.imageBytes ?? 0) + img.png.length;

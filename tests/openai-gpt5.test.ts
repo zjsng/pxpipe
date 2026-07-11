@@ -453,6 +453,27 @@ function buildResponsesInput(turns: number): Array<Record<string, unknown>> {
   return items;
 }
 
+function buildCodexCustomInput(turns: number): Array<Record<string, unknown>> {
+  const items: Array<Record<string, unknown>> = [
+    { role: 'user', content: `${OPENING_PROMPT_MARKER} `.repeat(40) },
+    {
+      type: 'agent_message',
+      author: '/root',
+      content: [
+        { type: 'input_text', text: 'Delegated task metadata' },
+        { type: 'encrypted_content', encrypted_content: 'opaque-secret-payload' },
+      ],
+    },
+  ];
+  for (let i = 0; i < turns; i++) {
+    const id = `custom_${i}`;
+    items.push({ type: 'custom_tool_call', call_id: id, name: 'exec', input: `run ${i} ` + 'x'.repeat(500) });
+    items.push({ type: 'custom_tool_call_output', call_id: id, output: `result ${i} ` + 'y'.repeat(1200) });
+    items.push({ type: 'reasoning', summary: [] });
+  }
+  return items;
+}
+
 function buildChatMessages(turns: number): Array<Record<string, unknown>> {
   const msgs: Array<Record<string, unknown>> = [
     { role: 'system', content: BIG_SLAB },
@@ -477,6 +498,26 @@ function buildChatMessages(turns: number): Array<Record<string, unknown>> {
 }
 
 describe('transformOpenAIResponses — history collapse', () => {
+  it.each(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+    'collapses %s custom-tool history after a preserved encrypted agent barrier', async (model) => {
+    const body = enc.encode(JSON.stringify({
+      model,
+      instructions: BIG_SLAB,
+      input: buildCodexCustomInput(20),
+    }));
+    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
+    expect(result.info.historyReason).toBe('collapsed');
+    expect(result.info.historyBarrierKind).toBe('agent_message');
+    expect(result.info.historyBaselineTokens ?? 0).toBeGreaterThan(result.info.historyImageTokens ?? 0);
+
+    const out = JSON.parse(dec.decode(result.body)) as { input: Array<Record<string, unknown>> };
+    expect(out.input.some((item) => item.type === 'agent_message')).toBe(true);
+    expect(JSON.stringify(out.input)).toContain('opaque-secret-payload');
+    const liveCustom = out.input.filter((item) => item.type === 'custom_tool_call');
+    const liveOutputs = out.input.filter((item) => item.type === 'custom_tool_call_output');
+    expect(liveCustom.length).toBe(liveOutputs.length);
+  });
+
   it('uses GPT page geometry and exact tokens for newline-heavy history', async () => {
     const input: Array<Record<string, unknown>> = [];
     for (let i = 0; i < 50; i++) {
