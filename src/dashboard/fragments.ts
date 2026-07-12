@@ -1171,7 +1171,9 @@ const CSS = `
   .pages-title { font-size: 11px; color: var(--ink-2); margin: 12px 0 6px; }
   .pages { display: flex; flex-wrap: wrap; gap: 8px; max-height: 320px; overflow: auto;
     background: var(--surface-2); padding: 8px; border: 1px solid var(--border); border-radius: 8px; }
-  .page { height: 130px; width: auto; max-width: 230px; object-fit: contain; object-position: top left;
+  /* Preserve both dimensions of each rendered page. A fixed height made every
+     page look equally tall, so short/partial pages were misleadingly enlarged. */
+  .page { width: auto; height: auto; max-width: 230px; max-height: 130px; object-fit: contain; object-position: top left;
     image-rendering: pixelated; background: #fff; border: 1px solid var(--border-strong); border-radius: 4px;
     cursor: pointer; transition: border-color .12s, transform .12s; }
   .page:hover { border-color: var(--flame); transform: translateY(-1px); }
