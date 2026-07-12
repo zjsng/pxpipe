@@ -933,6 +933,9 @@ async function main(): Promise<void> {
   // one-time cache-create amortization — so closing the loop would not
   // change decisions. Re-run that reconciliation before wiring one in.
   const tracker: Tracker = new FileTracker(opts.eventsFile);
+  // Passthrough can be intentional (A/B work or an emergency kill switch), so
+  // warn once per source rather than producing a warning on every request.
+  const warnedEligiblePassthroughSources = new Set<string>();
 
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the
   // events.jsonl so a single `rm -rf` cleans up both. Lazy-mkdir'd on first
@@ -970,7 +973,12 @@ async function main(): Promise<void> {
       // whole process, so the "normal" arm can be scripted on its own port while
       // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
-      if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
+      if (forcePassthrough) {
+        return { compress: false, compressionDisableSource: 'env' };
+      }
+      if (!dashboard.getCompressionEnabled()) {
+        return { compress: false, compressionDisableSource: 'dashboard' };
+      }
       // Active path: use DEFAULTS in transform.ts for break-even gating.
       return {
         gpt56PromptCaching: opts.gpt56PromptCaching,
@@ -981,6 +989,15 @@ async function main(): Promise<void> {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
       // info.firstImagePng, so capturing has to happen on the raw event.
       dashboard.update(e);
+      if (e.info?.eligibleButUncompressed) {
+        const source = e.info.compressionDisableSource ?? 'unknown';
+        if (!warnedEligiblePassthroughSources.has(source)) {
+          warnedEligiblePassthroughSources.add(source);
+          console.warn(
+            `[pxpipe] eligible GPT requests are passing through uncompressed (source=${source}); subsequent warnings for this source are suppressed`,
+          );
+        }
+      }
       // Debug: persist this request's rendered PNGs (see PXPIPE_DUMP_DIR above).
       // Filenames sort by request order: <stamp>_reqNNN_<model>_pNN.png.
       if (imageDumpDir && e.info?.imagePngs && e.info.imagePngs.length > 0) {

@@ -316,6 +316,8 @@ describe('serveFragment', () => {
     )).text();
     expect(html).toContain('history section source');
     expect(html).not.toContain('slab source');
+  });
+
   it('reports every GPT 5.6 service tier in recent requests', async () => {
     writeEvents(tmp, ['sol', 'terra', 'luna'].map((tier) => ev({
       path: '/responses',

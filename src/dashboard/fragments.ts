@@ -464,6 +464,11 @@ export interface ContextMapData {
   imageIds: number[]; // image-ring ids for the gallery
   compressed: boolean;
   model?: string;
+  /** Provider that billed the request; omitted in older persisted rows. */
+  provider?: 'anthropic' | 'openai' | 'other';
+  /** Upstream completion reason, retained so safety-withheld comparisons explain why. */
+  stopReason?: string;
+  safetyFlagged?: boolean;
   responsesComposition?: {
     instructions: number; systemDeveloper: number; userAssistant: number;
     functionCalls: number; functionOutputs: number; reasoningEncrypted: number;
@@ -514,7 +519,7 @@ export function renderContextMapFragment(
   const showCompare = c.haveBaseline && c.baselineInputEff > 0;
   const provider = c.provider ?? 'anthropic';
   const providerName = provider === 'openai' ? 'GPT / OpenAI' : provider === 'anthropic' ? 'Claude / Anthropic' : 'provider';
-  const modelLabel = c.model ? ` · ${escapeHtml(c.model)}` : '';
+  const modelSuffix = c.model ? ` · ${escapeHtml(c.model)}` : '';
   const base = c.baselineInputEff;
   const real = c.actualInputEff;
   const pct = showCompare ? Math.round((1 - real / base) * 100) : 0;
@@ -610,7 +615,7 @@ export function renderContextMapFragment(
 
   return (
     `<div class="ctxmap">` +
-    `<div class="ctx-headline"><span class="ctx-title">${title}${modelLabel}</span> ${headline}</div>` +
+    `<div class="ctx-headline"><span class="ctx-title">${title}${modelSuffix}</span> ${headline}</div>` +
     `<div class="split-note ctx-subnote">${subnote}</div>` +
     `<div class="legend"><span class="tag tag-img">Became an image</span><span class="tag tag-txt">Stayed as text</span></div>` +
     `<div class="split">` +

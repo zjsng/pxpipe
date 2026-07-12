@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
 import { openAIVisionTokens, visionTokensForModel, isClaudeModel, isGrokModel, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
+import { clearOpenAIRenderCache } from '../src/core/openai-render-cache.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -187,7 +188,22 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
     expect(tools[0]!.function.parameters?.properties?.x?.description).toBeUndefined();
   });
 
-  it('images GPT tool definitions even when there is no instruction context', async () => {
+  it('reports tab-width image-token counterfactuals without changing production rendering', async () => {
+    const tabbed = ('\tX\nabc\tY\n').repeat(2_000);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'system', content: tabbed }, { role: 'user', content: 'hello' }],
+    }));
+    const result = await transformOpenAIChatCompletions(body, { minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.gptRenderTabCount).toBe(4_000);
+    expect(result.info.gptRenderTabPaddingCells).toBe(6_000);
+    expect(result.info.gptImageTokensTabWidth4).toBe(result.info.imageTokens);
+    expect(result.info.gptImageTokensTabWidth2).toBeLessThanOrEqual(result.info.gptImageTokensTabWidth4!);
+    expect(result.info.gptImageTokensTabWidth1).toBeLessThanOrEqual(result.info.gptImageTokensTabWidth2!);
+  });
+
+  it('does not image tool prose that remains losslessly available in native definitions', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       messages: [{ role: 'user', content: 'hello' }],

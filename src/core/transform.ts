@@ -68,6 +68,11 @@ export interface RecoverableBlock {
 export interface TransformOptions {
   /** Master switch — false makes this a no-op pass-through. */
   compress?: boolean;
+  /** Telemetry-only provenance for an explicit `compress:false`. Hosts should
+   * set this when they can distinguish their kill switches. It never changes
+   * transform behaviour. An unspecified explicit false is classified as a
+   * request-level disable by the proxy. */
+  compressionDisableSource?: 'env' | 'dashboard' | 'request' | 'unknown';
   /** Move tool descriptions into the same image (and stub the originals). */
   compressTools?: boolean;
   /** Compress large `<system-reminder>` text blocks in the first user message. */
@@ -133,6 +138,7 @@ export interface TransformOptions {
 
 const DEFAULTS: Required<TransformOptions> = {
   compress: true,
+  compressionDisableSource: 'unknown',
   compressTools: true,
   compressReminders: true,
   compressToolResults: true,
@@ -502,6 +508,10 @@ export interface EnvFields {
 export interface TransformInfo {
   compressed: boolean;
   reason?: string;
+  /** A supported GPT request was deliberately forwarded without imaging. */
+  eligibleButUncompressed?: boolean;
+  /** Provenance of the switch that disabled an otherwise eligible request. */
+  compressionDisableSource?: 'env' | 'dashboard' | 'request' | 'unknown';
   origChars: number;
   /** Total source chars image-encoded this request (static slab + reminders + tool_results).
    *  Unlike `origChars` (static slab + tool docs only), reflects what `imageCount` replaced. */
@@ -514,6 +524,12 @@ export interface TransformInfo {
   /** GPT only. Vision tokens the rendered images actually cost as input
    *  (Σ openAIVisionTokens over real image dims). The "Sent as image" basis. */
   imageTokens?: number;
+  /** GPT slab + collapsed-history tab-layout counterfactuals. Production remains at width 4. */
+  gptRenderTabCount?: number;
+  gptRenderTabPaddingCells?: number;
+  gptImageTokensTabWidth4?: number;
+  gptImageTokensTabWidth2?: number;
+  gptImageTokensTabWidth1?: number;
   /** GPT only. o200k_base text tokens of the content pxpipe imaged/stripped —
    *  the would-have-paid "as plain text" baseline. Compared against imageTokens
    *  for the per-request saving. See src/core/openai-savings.ts. */

@@ -1,12 +1,19 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createProxy } from '../src/core/proxy.js';
 import { applyGpt56RequestOptimizations } from '../src/core/openai.js';
 import type { TransformInfo } from '../src/core/transform.js';
 
 const realFetch = globalThis.fetch;
+const originalModels = process.env.PXPIPE_MODELS;
+
+beforeEach(() => {
+  process.env.PXPIPE_MODELS = 'gpt-5.6';
+});
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  if (originalModels === undefined) delete process.env.PXPIPE_MODELS;
+  else process.env.PXPIPE_MODELS = originalModels;
 });
 
 async function captureForward(

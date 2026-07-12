@@ -6,6 +6,7 @@ import {
   multiColWidth,
   maxFittingCols,
   expandTabsInLine,
+  tabExpansionStats,
   minifyForRender,
   roleSlotSegment,
   slotCopyBody,
@@ -611,6 +612,13 @@ describe('renderer', () => {
   it('expandTabsInLine: no tabs → unchanged (fast path)', () => {
     expect(expandTabsInLine('a\nb')).toBe('a\nb');
     expect(expandTabsInLine('hello world')).toBe('hello world');
+  });
+
+  it('tabExpansionStats counts markers and only the padding cells after them', () => {
+    const text = '\tX\nabc\tY\n中\tZ';
+    expect(tabExpansionStats(text, 4)).toEqual({ tabCount: 3, paddingCells: 4 });
+    expect(tabExpansionStats(text, 2)).toEqual({ tabCount: 3, paddingCells: 2 });
+    expect(tabExpansionStats(text, 1)).toEqual({ tabCount: 3, paddingCells: 0 });
   });
 
   it('expandTabsInLine: tab after CJK uses visual width (中 = 2 cols)', () => {

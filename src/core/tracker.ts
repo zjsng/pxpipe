@@ -28,6 +28,9 @@ export interface TrackEvent {
   // From TransformInfo:
   compressed?: boolean;
   reason?: string;
+  /** Supported GPT request deliberately sent through the text path. */
+  eligible_but_uncompressed?: boolean;
+  compression_disable_source?: 'env' | 'dashboard' | 'request' | 'unknown';
   orig_chars?: number;
   /** Text-chars replaced by image blocks (slab + reminders + tool_results).
    *  Compare with image_count: textTokens(n/4) vs imageTokens(n×2500). */
@@ -38,6 +41,11 @@ export interface TrackEvent {
   image_pixels?: number;
   /** GPT only: vision tokens billed for rendered images. */
   image_tokens?: number;
+  gpt_render_tab_count?: number;
+  gpt_render_tab_padding_cells?: number;
+  gpt_image_tokens_tab_width_4?: number;
+  gpt_image_tokens_tab_width_2?: number;
+  gpt_image_tokens_tab_width_1?: number;
   /** GPT only: o200k text tokens the imaged/stripped content would have cost. */
   baseline_imaged_tokens?: number;
   /** TEXT chars in the outgoing body (all text blocks, incl. non-compressed tool_results).
@@ -241,6 +249,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (info) {
     if (info.compressed !== undefined) out.compressed = info.compressed;
     if (info.reason) out.reason = info.reason;
+    if (info.eligibleButUncompressed === true) out.eligible_but_uncompressed = true;
+    if (info.compressionDisableSource) {
+      out.compression_disable_source = info.compressionDisableSource;
+    }
     if (info.origChars !== undefined) out.orig_chars = info.origChars;
     if (info.compressedChars !== undefined && info.compressedChars > 0) {
       out.compressed_chars = info.compressedChars;
@@ -252,6 +264,13 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.imageTokens !== undefined && info.imageTokens > 0) {
       out.image_tokens = info.imageTokens;
+    }
+    if (info.gptRenderTabCount !== undefined && info.gptRenderTabCount > 0) {
+      out.gpt_render_tab_count = info.gptRenderTabCount;
+      out.gpt_render_tab_padding_cells = info.gptRenderTabPaddingCells ?? 0;
+      out.gpt_image_tokens_tab_width_4 = info.gptImageTokensTabWidth4;
+      out.gpt_image_tokens_tab_width_2 = info.gptImageTokensTabWidth2;
+      out.gpt_image_tokens_tab_width_1 = info.gptImageTokensTabWidth1;
     }
     if (info.baselineImagedTokens !== undefined && info.baselineImagedTokens > 0) {
       out.baseline_imaged_tokens = info.baselineImagedTokens;

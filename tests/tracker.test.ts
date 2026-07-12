@@ -211,6 +211,38 @@ describe('toTrackEvent', () => {
     expect(noBuckets.bucket_chars).toBeUndefined();
     expect(noBuckets.history_text_chars).toBeUndefined();
 
+    const eligiblePassthrough = toTrackEvent({
+      method: 'POST',
+      path: '/responses',
+      status: 200,
+      durationMs: 10,
+      info: {
+        compressed: false,
+        reason: 'compress=false',
+        origChars: 0,
+        eligibleButUncompressed: true,
+        compressionDisableSource: 'env',
+      },
+    });
+    expect(eligiblePassthrough.eligible_but_uncompressed).toBe(true);
+    expect(eligiblePassthrough.compression_disable_source).toBe('env');
+
+    const tabs = toTrackEvent({
+      method: 'POST', path: '/responses', status: 200, durationMs: 1,
+      info: {
+        compressed: true, origChars: 10, compressedChars: 10, imageCount: 1,
+        imageBytes: 10, staticChars: 10, dynamicChars: 0, dynamicBlockCount: 0,
+        gptRenderTabCount: 3, gptRenderTabPaddingCells: 5,
+        gptImageTokensTabWidth4: 100, gptImageTokensTabWidth2: 90,
+        gptImageTokensTabWidth1: 80,
+      },
+    });
+    expect(tabs.gpt_render_tab_count).toBe(3);
+    expect(tabs.gpt_render_tab_padding_cells).toBe(5);
+    expect(tabs.gpt_image_tokens_tab_width_4).toBe(100);
+    expect(tabs.gpt_image_tokens_tab_width_2).toBe(90);
+    expect(tabs.gpt_image_tokens_tab_width_1).toBe(80);
+
     const emptyBucketMap = toTrackEvent({
       method: 'POST',
       path: '/v1/messages',

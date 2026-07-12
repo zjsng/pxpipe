@@ -435,11 +435,11 @@ export function roleSlotSegment(tag: string, body: string, mark: string, attr = 
 
 /** Minify + tab-expand + join lines with ↵ sentinel. Returns null if text already
  *  contains ↵ (caller falls back to non-reflow path; vanishingly rare in practice). */
-export function reflow(text: string): string | null {
+export function reflow(text: string, tabWidth: number = TAB_WIDTH): string | null {
   if (text.indexOf(NL_SENTINEL) >= 0) return null;
   return minifyForRender(text)
     .split('\n')
-    .map(expandTabsInLine)
+    .map((line) => expandTabsInLineAtWidth(line, tabWidth))
     .join(NL_SENTINEL);
 }
 
@@ -452,12 +452,20 @@ export function dereflow(reflowed: string): string {
  *  model distinguish indent-spaces from intentional-spaces. Wide CJK chars count as 2 cols.
  *  U+0009 is absent from the atlas (control codepoint), so without this every tab was a drop. */
 export function expandTabsInLine(line: string): string {
+  return expandTabsInLineAtWidth(line, TAB_WIDTH);
+}
+
+/** Width-parametric tab expansion used only for layout counterfactuals. Keeping
+ * the public production helper unary avoids Array.map passing its item index as
+ * an accidental tab width. */
+function expandTabsInLineAtWidth(line: string, tabWidth: number): string {
   if (line.indexOf('\t') < 0) return line; // fast path
   let out = '';
   let col = 0;
   for (const ch of line) {
     if (ch === '\t') {
-      const span = TAB_WIDTH - (col % TAB_WIDTH);
+      const width = Math.max(1, tabWidth | 0);
+      const span = width - (col % width);
       out += '→'; // visible tab marker (1 col)
       if (span > 1) out += ' '.repeat(span - 1); // pad to next stop
       col += span;
@@ -467,6 +475,30 @@ export function expandTabsInLine(line: string): string {
     }
   }
   return out;
+}
+
+/** Count source tabs and the blank cells added after their visible marker. */
+export function tabExpansionStats(text: string, tabWidth: number = TAB_WIDTH): {
+  tabCount: number;
+  paddingCells: number;
+} {
+  let tabCount = 0;
+  let paddingCells = 0;
+  for (const line of text.split('\n')) {
+    let col = 0;
+    for (const ch of line) {
+      if (ch === '\t') {
+        const width = Math.max(1, tabWidth | 0);
+        const span = width - (col % width);
+        tabCount++;
+        paddingCells += span - 1;
+        col += span;
+      } else {
+        col += cellsFor(ch.codePointAt(0)!);
+      }
+    }
+  }
+  return { tabCount, paddingCells };
 }
 
 /** Visual width of a line in cells. Wide CJK = 2; enlarged ↵ = markerScale. */
@@ -529,11 +561,12 @@ export function wrapLines(
   cols: number,
   markerScale: number = 1,
   font: RenderFont = DEFAULT_RENDER_FONT,
+  tabWidth: number = TAB_WIDTH,
 ): string[] {
   const out: string[] = [];
   const minified = minifyForRender(text);
   for (const rawWithTabs of minified.split('\n')) {
-    const raw = expandTabsInLine(rawWithTabs);
+    const raw = expandTabsInLineAtWidth(rawWithTabs, tabWidth);
     if (raw.length === 0) {
       out.push('');
       continue;

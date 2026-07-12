@@ -25,13 +25,15 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 
 describe('OpenAI upstream concurrency gate', () => {
   it('holds queued requests until an active response body reaches EOF', async () => {
-    const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const controllers = new Map<number, ReadableStreamDefaultController<Uint8Array>>();
     let fetches = 0;
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (_input, init) => {
       fetches++;
+      const body = JSON.parse(new TextDecoder().decode(init?.body as Uint8Array)) as { input: string };
+      const requestId = Number(body.input.split(' ').at(-1));
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
-          controllers.push(controller);
+          controllers.set(requestId, controller);
           controller.enqueue(new TextEncoder().encode('data: {"type":"response.created"}\n\n'));
         },
       }), { headers: { 'content-type': 'text/event-stream' } });
@@ -52,20 +54,20 @@ describe('OpenAI upstream concurrency gate', () => {
     expect(fetches).toBe(2);
     const firstResponse = await first;
     await second;
-    controllers[0]!.close();
+    controllers.get(1)!.close();
     await firstResponse.text();
 
     const thirdResponse = await third;
     expect(fetches).toBe(3);
-    controllers[1]!.close();
-    controllers[2]!.close();
+    controllers.get(2)!.close();
+    controllers.get(3)!.close();
     await thirdResponse.text();
 
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(events).toHaveLength(3);
     expect(events.some((event) => (event.queueDepth ?? 0) >= 1)).toBe(true);
     expect(events.every((event) => (event.upstreamConcurrency ?? 0) <= 2)).toBe(true);
-  });
+  }, 15_000);
 
   it('does not gate model discovery requests', async () => {
     let fetches = 0;

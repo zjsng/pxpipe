@@ -21,9 +21,10 @@
  * HistoryTurn list and the planner/renderer are shared.
  */
 
-import { reflow, neutralizeSentinel, type RenderedImage } from './render.js';
+import { reflow, neutralizeSentinel, type RenderedImage, type RenderStyle } from './render.js';
 import { renderOpenAITextCached } from './openai-render-cache.js';
-import { GPT_MAX_HEIGHT_PX } from './gpt-model-profiles.js';
+import { GPT_MAX_HEIGHT_PX, DEFAULT_GPT_PROFILE } from './gpt-model-profiles.js';
+import { appendIdsBlock } from './factsheet.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 /** Portrait-strip width for GPT history images. Mirrors GPT_STRIP_COLS in
@@ -206,6 +207,15 @@ export interface GptCollapsePlan {
   renderCacheHits: number;
   renderCacheMisses: number;
   renderCacheSavedMs: number;
+  /** Raw accepted section texts, for render-layout counterfactual telemetry only. */
+  renderedSectionTexts: string[];
+  renderCols: number;
+  renderMaxHeightPx: number;
+  renderReflow: boolean;
+  /** First opaque item that prevented the planner from extending the closed
+   * prefix. Optional because pair-only Responses plans do not scan turns. */
+  opaqueBarrierIndex?: number;
+  opaqueBarrierKind?: string;
 }
 
 function safeJson(v: unknown): string {
@@ -290,10 +300,27 @@ export async function planGptCollapse(
     renderCacheHits: 0,
     renderCacheMisses: 0,
     renderCacheSavedMs: 0,
+    renderedSectionTexts: [],
+    renderCols: o.cols,
+    renderMaxHeightPx: o.maxHeightPx,
+    renderReflow: o.reflow,
   };
   const pp = Math.max(0, Math.min(protectedPrefix, turns.length));
   const rawCutoff = turns.length - o.keepTail;
-  if (rawCutoff - pp < o.minCollapsePrefix) {
+  const opaqueBarrierIndex = turns.findIndex((turn, index) =>
+    index >= pp && index < Math.max(pp, rawCutoff) && turn.opaque,
+  );
+  if (opaqueBarrierIndex >= 0) {
+    base.opaqueBarrierIndex = opaqueBarrierIndex;
+    base.opaqueBarrierKind = 'opaque';
+  }
+  // Item count is only a cache-amortization proxy. A single unusually large
+  // old item can already clear the real token break-even gate, so do not make
+  // it wait for nine unrelated turns before it becomes collapsible.
+  if (
+    rawCutoff - pp < o.minCollapsePrefix
+    && gptCountTokens(joinTurns(turns, pp, rawCutoff, -1)) < o.minCollapseTokens
+  ) {
     return { ...base, reason: 'prefix_too_short' };
   }
   // Snap the cutoff down to a collapseChunk grid (relative to pp) so the image
@@ -312,7 +339,10 @@ export async function planGptCollapse(
   if (boundary < pp) {
     return { ...base, reason: 'no_closed_prefix' };
   }
-  if (boundary + 1 - pp < o.minCollapsePrefix) {
+  if (
+    boundary + 1 - pp < o.minCollapsePrefix
+    && gptCountTokens(joinTurns(turns, pp, boundary + 1, -1)) < o.minCollapseTokens
+  ) {
     return { ...base, reason: 'prefix_too_short' };
   }
   const rawEnd = boundary + 1;
@@ -429,6 +459,7 @@ export async function planGptCollapse(
   }
   const maxImages = Math.max(0, Math.floor(o.maxImages));
   const rendered: Array<{ s: number; e: number; imgs: RenderedImage[] }> = [];
+  const renderedSectionTexts: string[] = [];
   let imgCount = 0;
   let collapseEnd = pp;
   let renderCacheHits = 0;
@@ -456,6 +487,7 @@ export async function planGptCollapse(
       break;
     }
     rendered.push({ s, e, imgs: sectionImgs });
+    renderedSectionTexts.push(safeSection);
     imgCount += sectionImgs.length;
     collapseEnd = e;
   }
@@ -511,6 +543,10 @@ export async function planGptCollapse(
     renderCacheHits,
     renderCacheMisses,
     renderCacheSavedMs,
+    renderedSectionTexts,
+    renderCols: o.cols,
+    renderMaxHeightPx: o.maxHeightPx,
+    renderReflow: o.reflow,
   };
 }
 
@@ -638,6 +674,10 @@ function emptyResponsesPairPlan(state: ResponsesPairState): ResponsesPairCollaps
     images: [], imagesAfter: [], imageSources: [], imageSourcesAfter: [],
     text: '', start: 0, endExclusive: 0, collapsedTurns: 0,
     collapsedChars: 0, droppedChars: 0, droppedCodepoints: new Map(),
+    renderCacheHits: 0, renderCacheMisses: 0, renderCacheSavedMs: 0,
+    renderedSectionTexts: [], renderCols: GPT_HISTORY_DEFAULTS.cols,
+    renderMaxHeightPx: GPT_HISTORY_DEFAULTS.maxHeightPx,
+    renderReflow: GPT_HISTORY_DEFAULTS.reflow,
     segments: [], selectedIndices: [], pairState: state,
   };
 }
@@ -677,13 +717,16 @@ export async function planResponsesPairCollapse(
     const safe = neutralizeSentinel(source);
     let renderedText = o.reflow ? reflow(safe) ?? safe : safe;
     if (o.idsBlock) renderedText = appendIdsBlock(renderedText);
-    const images = await renderTextToPngs(
-      renderedText, o.cols, o.style ?? {}, o.maxHeightPx,
+    const result = await renderOpenAITextCached(
+      renderedText, o.cols, o.maxHeightPx, o.style ?? {},
     );
-    return { source, renderedText, images };
+    return { source, renderedText, images: result.images, result };
   };
 
   const segments: ResponsesPairCollapseSegment[] = [];
+  let renderCacheHits = 0;
+  let renderCacheMisses = 0;
+  let renderCacheSavedMs = 0;
   let remainingImages = maxImages;
   let hitImageCap = false;
   for (const run of runs) {
@@ -704,6 +747,13 @@ export async function planResponsesPairCollapse(
     }
     if (!best || low === 0) { hitImageCap = true; break; }
     if (!isProfitable(best.renderedText, o.cols)) continue;
+
+    if (best.result.cacheHit) {
+      renderCacheHits++;
+      renderCacheSavedMs += best.result.savedRenderMs;
+    } else {
+      renderCacheMisses++;
+    }
 
     const selected = run.slice(0, low);
     const selectedIndices = selected
@@ -765,6 +815,13 @@ export async function planResponsesPairCollapse(
     droppedCodepoints,
     selectedIndices,
     pairState: state,
+    renderCacheHits,
+    renderCacheMisses,
+    renderCacheSavedMs,
+    renderedSectionTexts: segments.map((segment) => segment.text),
+    renderCols: o.cols,
+    renderMaxHeightPx: o.maxHeightPx,
+    renderReflow: o.reflow,
   };
 }
 

@@ -14,6 +14,8 @@ import {
   PAD_X,
   PAD_Y,
   READABLE_CHARS_PER_IMAGE,
+  wrapLines,
+  tabExpansionStats,
   type RenderedImage,
 } from './render.js';
 import {
@@ -426,9 +428,9 @@ function prepareImagedRenderText(text: string): string {
   return appendIdsBlock(text);
 }
 
-function maybeReflow(text: string, enabled: boolean): string {
+function maybeReflow(text: string, enabled: boolean, tabWidth: number = 4): string {
   if (!enabled) return text;
-  return reflow(text) ?? text;
+  return reflow(text, tabWidth) ?? text;
 }
 
 function isTextPart(part: unknown): part is OpenAITextPart {
@@ -719,12 +721,79 @@ function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<st
   return out;
 }
 
-/** Shared gate: image vs text token cost → profitability.
- *
- *  Text defaults to o200k (same baseline as savings math). Pass a non-default
- *  `charsPerToken` to force the length/cpt lever (tests use 1). Images bill full
- *  pages at maxHeight and the last page at residual height — charging every page
- *  as a full strip over-states cost and blocks profitable collapses. */
+/** GPT page-cost estimator that mirrors renderTextToPngs' real layout. The old
+ * gate reused Anthropic's 728px page count, then charged every estimated page
+ * as a full 1932px GPT image. Reflow's inline ↵ glyphs were also counted as
+ * row breaks. Together that rejected profitable history by 10× or more. */
+function estimateOpenAIImageTokens(
+  model: string,
+  text: string,
+  cols: number,
+  tabWidth: number = 4,
+  maxHeightPx: number = resolveGptProfile(model).maxHeightPx,
+): number {
+  const profile = resolveGptProfile(model);
+  const cellW = renderCellWidth(profile.style);
+  const cellH = renderCellHeight(profile.style);
+  const lines = wrapLines(text, cols, 1, profile.style.font, tabWidth);
+  const hardLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
+  const readableLines = Math.max(1, Math.floor(READABLE_CHARS_PER_IMAGE / Math.max(1, cols)));
+  const linesPerPage = Math.min(hardLines, readableLines);
+  const width = 2 * PAD_X + cols * cellW;
+
+  let total = 0;
+  let pageLines = 0;
+  let pageChars = 0;
+  const flush = (): void => {
+    if (pageLines === 0) return;
+    const height = 2 * PAD_Y + pageLines * cellH;
+    total += openAIVisionTokens(model, width, height);
+    pageLines = 0;
+    pageChars = 0;
+  };
+  for (const line of lines) {
+    const lineChars = line.length + (pageLines > 0 ? 1 : 0);
+    if (pageLines > 0 && (pageLines >= linesPerPage || pageChars + lineChars > READABLE_CHARS_PER_IMAGE)) {
+      flush();
+    }
+    pageLines++;
+    pageChars += line.length + (pageLines > 1 ? 1 : 0);
+  }
+  flush();
+  return total;
+}
+
+function recordTabCounterfactuals(
+  info: TransformInfo,
+  model: string,
+  sourceText: string,
+  header: string,
+  maxCols: number,
+  reflowEnabled: boolean,
+  maxHeightPx?: number,
+  shrinkWidth: boolean = true,
+): void {
+  const stats = tabExpansionStats(sourceText, 4);
+  if (stats.tabCount === 0) return;
+  const variant = (width: number): { text: string; cols: number } => {
+    const text = header + maybeReflow(sourceText, reflowEnabled, width);
+    const cols = shrinkWidth ? shrinkColsToContent(text, maxCols) : maxCols;
+    return { text, cols: Math.min(cols, resolveGptProfile(model).stripCols) };
+  };
+  const w4 = variant(4);
+  const w2 = variant(2);
+  const w1 = variant(1);
+  info.gptRenderTabCount = (info.gptRenderTabCount ?? 0) + stats.tabCount;
+  info.gptRenderTabPaddingCells = (info.gptRenderTabPaddingCells ?? 0) + stats.paddingCells;
+  info.gptImageTokensTabWidth4 = (info.gptImageTokensTabWidth4 ?? 0)
+    + estimateOpenAIImageTokens(model, w4.text, w4.cols, 4, maxHeightPx);
+  info.gptImageTokensTabWidth2 = (info.gptImageTokensTabWidth2 ?? 0)
+    + estimateOpenAIImageTokens(model, w2.text, w2.cols, 2, maxHeightPx);
+  info.gptImageTokensTabWidth1 = (info.gptImageTokensTabWidth1 ?? 0)
+    + estimateOpenAIImageTokens(model, w1.text, w1.cols, 1, maxHeightPx);
+}
+
+/** Shared gate: exact o200k text value vs actual GPT page geometry. */
 function evalOpenAIGate(
   model: string,
   renderedText: string,
@@ -889,6 +958,18 @@ function foldGptHistory(
   info.gptRenderCacheHits = (info.gptRenderCacheHits ?? 0) + plan.renderCacheHits;
   info.gptRenderCacheMisses = (info.gptRenderCacheMisses ?? 0) + plan.renderCacheMisses;
   info.gptRenderCacheSavedMs = (info.gptRenderCacheSavedMs ?? 0) + plan.renderCacheSavedMs;
+  for (const sectionText of plan.renderedSectionTexts) {
+    recordTabCounterfactuals(
+      info,
+      model,
+      sectionText,
+      '',
+      plan.renderCols,
+      plan.renderReflow,
+      plan.renderMaxHeightPx,
+      false,
+    );
+  }
 }
 
 const CHAT_HEADER =
@@ -961,7 +1042,8 @@ export async function transformOpenAIChatCompletions(
   const firstUser = firstUserText(req);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
-  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  const compactSource = compactSlabWhitespace(combinedRaw);
+  const combined = maybeReflow(compactSource, o.reflow);
   if (combined.length < o.minCompressChars) {
     info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
     return { body, info };
@@ -995,6 +1077,7 @@ export async function transformOpenAIChatCompletions(
     info.passthroughReasons = { not_profitable: 1 };
     return { body, info };
   }
+  recordTabCounterfactuals(info, req.model, compactSource, header, maxCols, o.reflow);
 
   const slabRender = await renderOpenAITextCached(
     renderedText,
@@ -1192,7 +1275,8 @@ export async function transformOpenAIResponses(
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
-  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  const compactSource = compactSlabWhitespace(combinedRaw);
+  const combined = maybeReflow(compactSource, o.reflow);
   if (combined.length < o.minCompressChars) {
     info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
     return { body, info };
@@ -1224,6 +1308,7 @@ export async function transformOpenAIResponses(
     info.passthroughReasons = { not_profitable: 1 };
     return { body, info };
   }
+  recordTabCounterfactuals(info, req.model, compactSource, header, maxCols, o.reflow);
 
   const slabRender = await renderOpenAITextCached(
     renderedText,
