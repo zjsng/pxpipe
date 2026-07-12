@@ -16,6 +16,7 @@ import {
   buildCacheablePrefixCountTokensBody,
 } from './measurement.js';
 import type { Usage } from './types.js';
+import { detectChatGptSubscription, type ChatGptSubscription } from './chatgpt-plan-usage.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -62,6 +63,8 @@ export interface ProxyEvent {
   /** Provider-reported service tier; model suffix is used as a fallback by
    * telemetry consumers when the upstream omits it. */
   serviceTier?: string;
+  /** Sanitized subscription metadata only; never contains auth/account claims. */
+  chatgptSubscription?: ChatGptSubscription;
   error?: string;
   /** First ~2 KiB of the upstream 4xx body (not captured on 2xx or 5xx). */
   errorBody?: string;
@@ -801,6 +804,7 @@ export function createProxy(config: ProxyConfig = {}) {
           measurement,
           stopReason,
           serviceTier,
+          chatgptSubscription,
         });
       };
       void finalize();
@@ -817,6 +821,9 @@ export function createProxy(config: ProxyConfig = {}) {
       config.openAIApiKey !== undefined,
     );
     const upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
+    const chatgptSubscription = isOpenAIPath
+      ? detectChatGptSubscription(upstreamBase, req.headers)
+      : undefined;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;

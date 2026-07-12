@@ -156,6 +156,11 @@ export interface TrackEvent {
   stop_reason?: string;
   /** Provider-reported service tier, or a model-suffix fallback. */
   service_tier?: string;
+  chatgpt_subscription?: true;
+  chatgpt_plan_key?: string;
+  chatgpt_plan_label?: string;
+  chatgpt_plan_source?: 'jwt_allowlisted_claim' | 'subscription_transport';
+  chatgpt_plan_confidence?: 'high' | 'medium';
   /** True when the stop reason indicates a safety classifier fired ("refusal" /
    *  "content_filter"). Refusal rows emit almost no output and would otherwise
    *  read as "cheap" — scorers MUST fail cost comparisons on these rows, and a
@@ -405,6 +410,13 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   }
   const tier = serviceTierFor(ev.model, ev.serviceTier);
   if (tier) out.service_tier = tier;
+  if (ev.chatgptSubscription) {
+    out.chatgpt_subscription = true;
+    if (ev.chatgptSubscription.planKey) out.chatgpt_plan_key = ev.chatgptSubscription.planKey;
+    out.chatgpt_plan_label = ev.chatgptSubscription.planLabel;
+    out.chatgpt_plan_source = ev.chatgptSubscription.source;
+    out.chatgpt_plan_confidence = ev.chatgptSubscription.confidence;
+  }
   return out;
 }
 

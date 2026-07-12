@@ -59,6 +59,7 @@ import {
   renderStatsTableFragment,
   type ContextMapData,
 } from './dashboard/fragments.js';
+import { estimatePlanPercentages, planTierMultiplier } from './core/chatgpt-plan-usage.js';
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
@@ -633,6 +634,17 @@ export class DashboardState {
    *  matches Fable. Verbatim recall is still lossy; the dashboard toggle
    *  remains the kill switch. See FINDINGS.md. */
   private compressionEnabled = true;
+  /** Sanitized ChatGPT subscription metadata and cumulative tier-weighted
+   * savings. Unknown service tiers are deliberately excluded (fail closed). */
+  private chatgptPlan?: {
+    label: string;
+    key?: string;
+    source: 'jwt_allowlisted_claim' | 'subscription_transport';
+    confidence: 'high' | 'medium';
+    weightedSavings: number;
+    measuredRequests: number;
+    unknownTierRequests: number;
+  };
   /** Recent requests' transform breakdowns, for the Context Map panel + its
    *  history selector. In-memory ring, newest last. */
   private contextHistory: ContextMapData[] = [];
@@ -718,6 +730,18 @@ export class DashboardState {
     // the dashboard can pull the exact image that request rendered.
     const provider = providerForPath(ev.path, ev.model);
     const tier = serviceTierFor(ev.model, ev.serviceTier);
+    if (ev.chatgptSubscription) {
+      const prior = this.chatgptPlan;
+      this.chatgptPlan = {
+        label: ev.chatgptSubscription.planLabel,
+        key: ev.chatgptSubscription.planKey,
+        source: ev.chatgptSubscription.source,
+        confidence: ev.chatgptSubscription.confidence,
+        weightedSavings: prior?.weightedSavings ?? 0,
+        measuredRequests: prior?.measuredRequests ?? 0,
+        unknownTierRequests: prior?.unknownTierRequests ?? 0,
+      };
+    }
     const imgIds = ev.info
       ? this.captureImage(ev.info, { provider, model: ev.model, serviceTier: tier })
       : [];
@@ -1027,6 +1051,14 @@ export class DashboardState {
       pt.rawActualTokens += rawActual;
       pt.rawBaselineTokens += rawBaseline;
       pt.rawOutputTokens += out;
+      if (ev.chatgptSubscription && provider === 'openai' && this.chatgptPlan) {
+        const multiplier = planTierMultiplier(tier);
+        if (multiplier === undefined) this.chatgptPlan.unknownTierRequests += 1;
+        else {
+          this.chatgptPlan.weightedSavings += Math.max(0, baselineInputEff - actualInputEff) * multiplier;
+          this.chatgptPlan.measuredRequests += 1;
+        }
+      }
     }
 
     const row: RecentRow = {
@@ -1122,6 +1154,18 @@ export class DashboardState {
       const provider = providerForPath(t.path, t.model);
       const gpt = provider === 'openai';
       const tier = serviceTierFor(t.model, t.service_tier);
+      if (t.chatgpt_subscription === true) {
+        const prior = this.chatgptPlan;
+        this.chatgptPlan = {
+          label: t.chatgpt_plan_label ?? 'ChatGPT plan (type unavailable)',
+          key: t.chatgpt_plan_key,
+          source: t.chatgpt_plan_source ?? 'subscription_transport',
+          confidence: t.chatgpt_plan_confidence ?? 'medium',
+          weightedSavings: prior?.weightedSavings ?? 0,
+          measuredRequests: prior?.measuredRequests ?? 0,
+          unknownTierRequests: prior?.unknownTierRequests ?? 0,
+        };
+      }
       const safety = t.safety_flagged === true || safetyStop(t.stop_reason);
       const completionSec = Date.parse(t.ts) / 1000;
       const acc = accountUsage(
@@ -1367,6 +1411,14 @@ export class DashboardState {
           sp.rawActualTokens += rawActual;
           sp.rawBaselineTokens += rawBaseline;
           sp.rawOutputTokens += out;
+          if (t.chatgpt_subscription === true && provider === 'openai' && this.chatgptPlan) {
+            const multiplier = planTierMultiplier(tier);
+            if (multiplier === undefined) this.chatgptPlan.unknownTierRequests += 1;
+            else {
+              this.chatgptPlan.weightedSavings += Math.max(0, baselineInputEff - actualInputEff) * multiplier;
+              this.chatgptPlan.measuredRequests += 1;
+            }
+          }
         }
       }
       const row: RecentRow = {
@@ -1653,6 +1705,30 @@ export class DashboardState {
     );
 
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
+    const planUsage = this.chatgptPlan
+      ? (() => {
+          const estimates = estimatePlanPercentages(this.chatgptPlan.weightedSavings);
+          return {
+            subscription: true as const,
+            plan_key: this.chatgptPlan.key,
+            plan_label: this.chatgptPlan.label,
+            detection_source: this.chatgptPlan.source,
+            detection_confidence: this.chatgptPlan.confidence,
+            plan_weighted_savings: Math.round(this.chatgptPlan.weightedSavings),
+            measured_requests: this.chatgptPlan.measuredRequests,
+            unknown_tier_requests: this.chatgptPlan.unknownTierRequests,
+            five_hour_pct_preserved: {
+              min: round1(estimates.fiveHour.min), max: round1(estimates.fiveHour.max),
+            },
+            weekly_pct_preserved: {
+              min: round1(estimates.weekly.min), max: round1(estimates.weekly.max),
+            },
+            calibration_source: 'empirical_transcript_range' as const,
+            calibration_note: 'Observed, user-specific calibration; not an official OpenAI quota.',
+            caveat: 'Cumulative across logged and reset windows; not your current remaining balance. OpenAI limits can change.',
+          };
+        })()
+      : undefined;
     const payload = {
       accounting_basis: 'provider-specific input-credit equivalents; mixed-provider totals are not a single USD currency',
       requests: this.totals.requests,
@@ -1725,6 +1801,7 @@ export class DashboardState {
       safety_flagged: [...this.totals.providerTotals.values()]
         .reduce((n, p) => n + p.safetyFlagged, 0),
       providers,
+      ...(planUsage ? { chatgpt_plan_usage: planUsage } : {}),
       pricing_by_provider: {
         anthropic: {
           monetary_supported: true,

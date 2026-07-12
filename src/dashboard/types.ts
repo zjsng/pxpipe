@@ -43,6 +43,8 @@ export interface StatsPayload {
   /** Provider-specific accounting buckets. OpenAI has no monetary conversion. */
   providers?: Record<string, DashboardProviderStats>;
   pricing_by_provider?: Record<string, ProviderPricingAssumptions>;
+  /** Present only after privacy-safe ChatGPT subscription traffic is observed. */
+  chatgpt_plan_usage?: ChatGptPlanUsage;
   measured_text_chars: number;
   measured_thinking_chars: number;
   measured_tool_use_chars: number;
@@ -50,6 +52,22 @@ export interface StatsPayload {
   events_with_measurement: number;
   uptime_sec_unused?: never; // future-proof
   compression_enabled: boolean;
+}
+
+export interface ChatGptPlanUsage {
+  subscription: true;
+  plan_key?: string;
+  plan_label: string;
+  detection_source: 'jwt_allowlisted_claim' | 'subscription_transport';
+  detection_confidence: 'high' | 'medium';
+  plan_weighted_savings: number;
+  measured_requests: number;
+  unknown_tier_requests: number;
+  five_hour_pct_preserved: { min: number; max: number };
+  weekly_pct_preserved: { min: number; max: number };
+  calibration_source: 'empirical_transcript_range';
+  calibration_note: string;
+  caveat: string;
 }
 
 export interface ProviderPricingAssumptions {

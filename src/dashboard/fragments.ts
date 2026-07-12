@@ -347,6 +347,17 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     costTile +
     `</div>`;
 
+  const plan = s.chatgpt_plan_usage;
+  const planCard = plan ?
+    `<section class="plan-card" aria-label="ChatGPT plan usage saved">` +
+    `<div><span class="eyebrow">${escapeHtml(plan.plan_label)} · ${escapeHtml(plan.detection_confidence)} confidence · ${escapeHtml(plan.detection_source === 'jwt_allowlisted_claim' ? 'allowlisted plan claim' : 'subscription transport')}</span>` +
+    `<h2>Estimated plan usage preserved</h2></div>` +
+    `<div class="plan-metric"><strong>${kFmt(plan.plan_weighted_savings)}</strong><span>plan-weighted token equivalents</span></div>` +
+    `<div class="plan-metric"><strong>${plan.five_hour_pct_preserved.min.toFixed(1)}–${plan.five_hour_pct_preserved.max.toFixed(1)} pts</strong><span>of a 5-hour allowance</span></div>` +
+    `<div class="plan-metric"><strong>${plan.weekly_pct_preserved.min.toFixed(1)}–${plan.weekly_pct_preserved.max.toFixed(1)} pts</strong><span>of a weekly allowance</span></div>` +
+    `<p>${escapeHtml(plan.caveat)} Estimate based on observed calibration, not an official quota.${plan.unknown_tier_requests ? ` ${numFmt(plan.unknown_tier_requests)} measured request(s) with unknown tiers were excluded.` : ''}</p>` +
+    `</section>` : '';
+
   // math drawer
   const inputFormula = mixed
     ? 'provider-specific counterfactual input − provider-specific actual input'
@@ -430,7 +441,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   // NOTE: tests assert the header fragment contains the port number.
   const updated = `<div class="updated"><span class="live-dot"></span>live · port ${port} · uptime ${formatDuration(s.uptime_sec)}</div>`;
 
-  return strip + drawer + updated;
+  return strip + planCard + drawer + updated;
 }
 
 // ---- request x-ray (image vs text breakdown) -----------------------------
@@ -1072,6 +1083,17 @@ const CSS = `
     pointer-events: none; opacity: 0; visibility: hidden; transition: opacity .12s, visibility .12s; }
   .q:hover::after, .q:focus-visible::after { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
   .q:hover::before, .q:focus-visible::before { opacity: 1; visibility: visible; }
+  .plan-card { margin: 0 0 20px; padding: 18px 20px; background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--flame); border-radius: 8px; display: grid;
+    grid-template-columns: minmax(230px, 1.5fr) repeat(3, minmax(145px, 1fr)); gap: 18px; align-items: center; }
+  .plan-card .eyebrow { color: var(--flame-ink); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+  .plan-card h2 { margin: 5px 0 0; font-size: 18px; color: var(--ink); }
+  .plan-metric strong, .plan-metric span { display: block; }
+  .plan-metric strong { color: var(--good); font-size: 20px; font-variant-numeric: tabular-nums; }
+  .plan-metric span { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .plan-card p { grid-column: 1 / -1; margin: 0; padding-top: 10px; border-top: 1px dashed var(--border-strong); color: var(--muted); font-size: 11px; }
+  @media (max-width: 900px) { .plan-card { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .plan-card { grid-template-columns: 1fr; } }
 
   /* drawer */
   .drawer { margin: 0 0 20px; background: var(--surface); border: 1px solid var(--border);
